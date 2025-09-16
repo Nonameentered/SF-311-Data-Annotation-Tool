@@ -1,39 +1,98 @@
-# SF311 Homelessness Labeling Design Doc
+# SF311 Homelessness Labeling v1 Design
 
-## Purpose
-Transform raw SF311 homelessness calls (`data/homeless.txt`) into a reliable evaluation dataset for triaging requests by priority. The system should surface high-signal features from text and images, capture consistent human labels, and provide tooling to benchmark candidate models (LLMs or lighter classifiers).
+## Mission
+Stand up an image-first labeling workflow for SF311 homelessness reports so we can ship a vetted evaluation set quickly. Priorities:
+- Keep high-signal images and text aligned while annotators label a request at a time.
+- Cache external media locally to avoid link rot and to support offline review.
+- Capture clean labels (priority + contextual features) and track dataset drift run-to-run.
+- Run LLM-based analyses offline only after we have gold labels; the app stays human-first.
 
-## Current Assets
-- **ETL scripts** (`scripts/sf311_transform.py`, `sf311_audit.py`, `sf311_eval.py`) normalize records, run QA checks, and emit rich features (keywords, tag bounds, image URLs).
-- **Streamlit HITL prototype** (`scripts/labeler_app.py`) queues transformed reports, renders photos, and records multi-label priority annotations into `data/golden.jsonl`.
-- **Existing tags** inside `homeless_tags` (e.g., `safety_issue`, `tents_or_makeshift_present`, `person_lying_face_down_on_sidewalk`). These provide weak, sometimes inconsistent supervisory signals.
+## End-to-End Pipeline
+1. **Ingest & Cache Media**
+   - Run `make fetch-images` → download referenced photo URLs into `data/images/{request_id}/file.jpg` with SHA256 checksums. Skip re-downloads when checksum matches; log failures.
+   - Update `.gitignore` to exclude cached media.
+   - Persist a manifest `data/images/manifest.jsonl` mapping remote URL → local path + checksum.
+2. **Transform & Feature Extraction**
+   - `make transform` calls `scripts/sf311_transform.py` to normalize raw rows into JSONL/Parquet/CSV.
+   - Augment rows with cached image metadata (`image_paths`, `image_checksums`, `image_fetch_status`).
+   - Maintain lightweight keyword flags and derived metrics; prune unused helpers later.
+3. **Audit & Drift Tracking**
+   - `make audit` prints distributions (photo coverage, districts, tag/value counts) and now writes a JSON snapshot under `data/audit/` for longitudinal monitoring.
+   - `make eval` runs rule-based checks (keyword agreement, numeric bounds) producing `data/eval_report.json`.
+   - Add pytest coverage for schema + checksum expectations (e.g., `tests/test_transform.py`).
+4. **Label Collection (Streamlit)**
+   - `make labeler` launches `scripts/labeler_app.py`.
+   - Primary auth path: Supabase email/password (self-serve sign-up, email verification). Provide `SUPABASE_URL` + `SUPABASE_ANON_KEY`/`SUPABASE_SERVICE_ROLE_KEY` via env vars. File-based auth remains as a local fallback.
+   - Enforces a cap of three distinct annotators per request; individuals can load/revise their prior submission, flag items for review, and set label status (`pending`/`resolved`).
+   - Saves events into a Supabase `labels` table (JSON payload) and optionally mirrors to per-day JSONL backups (`data/labels/{date}/labels.jsonl`). In production set `LABELS_JSONL_BACKUP=0` to disable local copies.
+   - Bounding boxes are postponed; design keeps room to plug `streamlit-drawable-canvas` later.
+5. **Gold Set Assembly**
+   - CLI (`scripts/label_ops.py`, future) merges verified labels with transformed rows, resolves conflicts, and materializes evaluation splits under `data/eval/v1/`.
+   - Offline notebooks/CLI run GPT-5-nano or lightweight OSS models on the gold set for benchmarking; outputs live outside the app (`analysis/`).
 
-## Pipeline Architecture
-1. **Ingest & Normalize**: Use `make transform` to parse SF311 exports (API wrapper, JSON/JSONL) into canonical fields and heuristic features (keyword flags, derived private-property indicator, photo presence). Clamp numeric tags to plausible ranges.
-2. **Audit & QA**: `make audit` reports distributional stats and identifies inconsistent tag combinations; `make eval` writes binary QA results for regression testing.
-3. **Label Collection**: Human annotators filter queues (e.g., only photo-backed, "passed_out" keyword) and assign priority classes (P1–P4) plus auxiliary feature bins via Streamlit. Consider exporting the same interface via Shiny for Python if deployment constraints favor a server-rendered UI; the backend data contract remains identical.
-4. **Dataset Assembly**: Merge transformed rows with golden labels, snapshotting splits (train/dev/eval) and preserving provenance (annotator, timestamp, abstentions).
+## Label Schema (v1)
+Each label entry contains:
+```json
+{
+  "label_id": "uuid",
+  "request_id": "string",
+  "annotator_uid": "uuid",
+  "annotator": "string",  // display name
+  "annotator_display": "string",
+  "role": "annotator" | "reviewer",
+  "timestamp": "ISO-8601",
+  "priority": "P1" | "P2" | "P3" | "P4",
+  "features": {
+    "lying_face_down": bool,
+    "safety_issue": bool,
+    "drugs": bool,
+    "tents_present": bool,
+    "blocking": bool,
+    "on_ramp": bool,
+    "propane_or_flame": bool,
+    "children_present": bool,
+    "wheelchair": bool,
+    "num_people_bin": "0" | "1" | "2-3" | "4-5" | "6+",
+    "size_feet_bin": "0" | "1-20" | "21-80" | "81-150" | "150+"
+  },
+  "abstain": bool,
+  "needs_review": bool,
+  "status": "pending" | "resolved",
+  "notes": "string | null",
+  "image_paths": ["data/images/..."],
+  "image_checksums": ["sha256:..."],
+  "revision_of": "uuid | null"
+}
+```
+Future optional fields: `bounding_boxes`.
 
-## Labeling Strategy
-- **Text Signals**: Pre-highlight keywords (blocking, fire, children) and allow annotators to confirm or override them. LLM assistance (e.g., GPT-4o mini, Claude Haiku) can draft rationales cheaply via batch prompts; keep them out of the gold labels but store as machine suggestions.
-- **Image Annotations**: Start with binary/tiered attributes (tents present, visible fire, crowd size). Bounding boxes are optional—add them later only if object localization becomes critical or misclassification rates remain high. If needed, evaluate cheaper vision models (e.g., Grounding DINO, MobileSAM) for pre-annotations before requesting manual refinements.
-- **Cost Controls**: Use small open-source language models (e.g., `phi-4`, `llama-3.1-8b`) or API micro-models for pseudo-labeling. Accept abstentions and review conflicts via double labeling on high-priority cases.
+Supabase table (`labels`) should mirror the schema above (JSONB column for `features`, TEXT for IDs, BOOLEAN flags). Set row-level security or policies to allow authenticated users to insert/select their own rows while reviewers can read all.
 
-## Leveraging Existing Tags
-Treat `homeless_tags` values as noisy priors. They offer quick positives for tents, drugs, and safety issues but miss nuance (no confidence scores, occasional contradictory flags). Use them to:
-- Seed labeler queues (e.g., prioritize `safety_issue=True` for early review).
-- Generate heuristics for model bootstrapping.
-- Flag inconsistencies during QA (already partially covered by `make eval`).
-Avoid training solely on these tags; compare them against human-labeled subsets to quantify precision/recall.
+## Streamlit Application Requirements
+- **Layout**: image gallery (max 9 photos) takes majority width; textual context + auto-tags + metadata on the side.
+- **Queue controls**: filters on photos/no photos, keywords, derived tags, and request status (`unlabeled`, `needs_review`, `conflict`, `labeled`). Deterministic seeding keeps the queue predictable.
+- **Auth & Roles**: login form backed by `config/annotators.json` (overridable via env var). Annotator identity is fixed for the session and stored with every label event.
+- **Persistence**: labels append to per-day JSONL logs (`data/labels/YYYYMMDD/labels.jsonl`). Each event includes a `label_id`, `revision_of`, and status flags to support reconciliation.
+- **Resilience**: handle missing images gracefully (show placeholders, surface fetch errors), allow keyboard-enabled navigation.
+- **Metrics**: surface counts for queue size, total labeled requests, conflicts, and per-status tallies.
 
-## Evaluation Dataset Plan
-- Target ~1k+ labeled requests with balanced coverage across districts, photo availability, and keyword scenarios.
-- Store each record with source text, image URLs (hashed if sensitive), automated feature vector, human priority, and rationale notes.
-- Maintain versioned splits and changelog per release (e.g., `data/eval/v1/`).
-- Track metrics: priority accuracy, recall@P1 for emergencies, feature agreement rates. Run evaluations via `make eval` plus dedicated pytest cases for dataset integrity.
+## Dataset Monitoring
+- Save audit snapshots (`data/audit/{timestamp}.json`) capturing counts of requests, photo coverage, keyword frequencies, district distribution.
+- Compare latest snapshot against prior to flag shifts (simple diff script or notebook).
+- Track labeling throughput using Supabase queries (or JSONL backups) to compute per-annotator counts, status mix, and conflicts; surface trends in a lightweight dashboard or scheduled notebook.
+- Store checksum manifest for images to detect corrupt files; rerun fetch when checksum changes.
 
-## Next Steps
-1. Hard-code dataset schema and merge logic for `data/golden.jsonl` into the transform pipeline.
-2. Add CLI tools for sampling unlabeled vs. labeled coverage and exporting annotation tasks.
-3. Prototype LLM prompting vs. gradient-boosted baselines on text-only features; layer image signals once photo coverage improves.
-4. Document deployment plan for the labeling UI (Streamlit Cloud vs. containerized service) and add authentication before inviting annotators.
+## Deployment Playbook
+1. **Supabase setup**: create a project, enable email auth with self-service sign-up, and create a `labels` table with columns matching the schema (use JSONB for `features`, arrays for `image_paths`/`image_checksums`). Configure RLS to allow authenticated users to insert/update their own rows and reviewers to read all data.
+2. **Secrets**: provide `SUPABASE_URL` + `SUPABASE_ANON_KEY` (or service key) and optional `LABELER_DATA_DIR`, `LABELS_OUTPUT_DIR`, `LABELS_JSONL_BACKUP` via environment variables or Streamlit secrets.
+3. **Build & deploy**: containerize or use Streamlit Community Cloud. During build run `uv sync`, `make transform`, `make fetch-images`, and mount persistent storage (S3/GCS or volume) for image cache + JSONL backups.
+4. **Runtime**: launch the Streamlit app with `streamlit run scripts/labeler_app.py --server.port $PORT --server.address 0.0.0.0`. Ensure the container can reach Supabase and image storage.
+5. **Ops**: schedule `make transform`, `make fetch-images`, and `make audit --snapshot-out ...` (cron, GitHub Actions, or Cloud Scheduler) to refresh data and drop snapshots in storage. Use Supabase SQL or notebooks for reconciliation and exporting evaluation splits.
+
+GitHub Actions pipeline (`.github/workflows/data-refresh.yml`) runs the transform → fetch-images → audit sequence on every push to `main` and nightly; configure repository secrets (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, optional storage keys) before enabling it.
+
+## Open Questions / Future Work
+- Conflict resolution workflow once multiple annotators submit conflicting priorities.
+- Storage strategy for large image cache (consider external bucket once dataset grows).
+- Integration of semi-automated suggestions (LLMs, detectors) into UI without biasing annotators.
+- Deployment: Streamlit Community Cloud vs. container (document secrets + auth once selected).

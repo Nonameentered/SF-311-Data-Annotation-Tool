@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse, json, re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from rich import print
@@ -42,6 +42,7 @@ def parse_args():
     ap.add_argument("--parquet", help="Optional Parquet output path")
     ap.add_argument("--csv", help="Optional CSV output path")
     ap.add_argument("--size-max", type=float, default=400.0, help="Clip tag_size_feet to [0, size-max]")
+    ap.add_argument("--manifest", help="Image manifest JSONL from fetch-images")
     return ap.parse_args()
 
 def load_records(path: Path) -> List[Dict[str, Any]]:
@@ -120,6 +121,31 @@ def collect_image_urls(rec: Dict[str, Any]) -> list[str]:
             seen.add(u); out.append(u)
     return out
 
+
+def load_manifest(path: Optional[Path]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    if path is None or not path.exists():
+        return {}
+    mapping: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                rec = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            req_id = rec.get("request_id")
+            if req_id is None:
+                req_id = ""
+            else:
+                req_id = str(req_id)
+            url = rec.get("url")
+            if not url:
+                continue
+            mapping[(req_id, url)] = rec
+    return mapping
+
 def extract_text_feats(txt: str) -> Dict[str, Any]:
     if not txt:
         feats = {"desc_len": 0}
@@ -130,13 +156,27 @@ def extract_text_feats(txt: str) -> Dict[str, Any]:
         feats[f"kw_{k}"] = bool(pat.search(txt))
     return feats
 
-def normalize_record(rec: Dict[str, Any], size_max: float) -> Dict[str, Any]:
+def normalize_record(
+    rec: Dict[str, Any], size_max: float, manifest: Dict[Tuple[str, str], Dict[str, Any]]
+) -> Dict[str, Any]:
     tags = rec.get("homeless_tags") or {}
     text = (rec.get("description") or "").strip()
     feats = extract_text_feats(text)
     images = collect_image_urls(rec)
+    request_id = rec.get("service_request_id") or rec.get("id")
+    req_key = str(request_id) if request_id is not None else ""
+
+    image_paths: List[Optional[str]] = []
+    image_checksums: List[Optional[str]] = []
+    image_status: List[Optional[str]] = []
+    for url in images:
+        entry = manifest.get((req_key, url)) or manifest.get(("", url))
+        image_paths.append(entry.get("local_path") if entry else None)
+        image_checksums.append(entry.get("sha256") if entry else None)
+        image_status.append(entry.get("status") if entry else None)
+
     out = {
-        "request_id": rec.get("service_request_id") or rec.get("id"),
+        "request_id": request_id,
         "created_at": parse_dt(rec.get("requested_datetime") or rec.get("created_at") or rec.get("createdDate")),
         "status": rec.get("status"),
         "status_notes": rec.get("status_notes") or rec.get("statusNotes"),
@@ -145,6 +185,9 @@ def normalize_record(rec: Dict[str, Any], size_max: float) -> Dict[str, Any]:
         "lon": to_num(rec.get("long") or rec.get("lon") or rec.get("longitude")),
         "has_photo": len(images) > 0,
         "image_urls": images or None,
+        "image_paths": image_paths or None,
+        "image_checksums": image_checksums or None,
+        "image_fetch_status": image_status or None,
         "text": text if text else None,
         **feats,
         "tag_safety_issue": to_bool(tags.get("safety_issue")),
@@ -167,7 +210,9 @@ def main():
     args = parse_args()
     inp = Path(args.input)
     out_jsonl = Path(args.jsonl); out_jsonl.parent.mkdir(parents=True, exist_ok=True)
-    rows = [normalize_record(r, args.size_max) for r in load_records(inp)]
+    manifest_path = Path(args.manifest) if args.manifest else None
+    manifest = load_manifest(manifest_path)
+    rows = [normalize_record(r, args.size_max, manifest) for r in load_records(inp)]
     with out_jsonl.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")

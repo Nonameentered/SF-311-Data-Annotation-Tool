@@ -8,6 +8,8 @@ OUT_CSV      ?= data/transformed.csv
 REPORT       ?= data/eval_report.json
 SIZE_MAX     ?= 400
 SHOW         ?= 10
+IMAGES_DIR   ?= data/images
+MANIFEST     ?= $(IMAGES_DIR)/manifest.jsonl
 
 .DEFAULT_GOAL := help
 
@@ -37,7 +39,8 @@ transform: ## Parse + normalize raw file → JSONL (and Parquet/CSV)
 	  --jsonl  $(OUT_JSONL) \
 	  --parquet $(OUT_PARQUET) \
 	  --csv    $(OUT_CSV) \
-	  --size-max $(SIZE_MAX)
+	  --size-max $(SIZE_MAX) \
+	  --manifest $(MANIFEST)
 
 .PHONY: audit
 audit: ## Pandas EDA: counts, distributions, sanity checks
@@ -52,6 +55,15 @@ eval: ## Binary pass/fail feature checks → JSON report
 	$(UV) run scripts/sf311_eval.py \
 	  --input  $(OUT_JSONL) \
 	  --report $(REPORT)
+
+.PHONY: fetch-images
+fetch-images: ## Download and cache images referenced in transformed data
+	$(call _header,Fetch Images)
+	mkdir -p $(IMAGES_DIR)
+	$(UV) run scripts/fetch_images.py \
+	  --input $(OUT_JSONL) \
+	  --out-dir $(IMAGES_DIR) \
+	  --manifest $(MANIFEST)
 
 .PHONY: labeler
 labeler: ## Launch Streamlit HITL labeler

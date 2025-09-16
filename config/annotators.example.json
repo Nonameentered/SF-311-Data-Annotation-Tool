@@ -1,0 +1,10 @@
+{
+  "users": [
+    {
+      "id": "demo",
+      "name": "Demo Annotator",
+      "password_hash": "",
+      "role": "annotator"
+    }
+  ]
+}
