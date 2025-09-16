@@ -175,11 +175,26 @@ def normalize_record(
         image_checksums.append(entry.get("sha256") if entry else None)
         image_status.append(entry.get("status") if entry else None)
 
+    created_at = parse_dt(
+        rec.get("requested_datetime") or rec.get("created_at") or rec.get("createdDate")
+    )
+    updated_at = parse_dt(
+        rec.get("updated_datetime")
+        or rec.get("closed_date")
+        or rec.get("updatedDate")
+        or rec.get("service_updated_datetime")
+    )
+
     out = {
         "request_id": request_id,
-        "created_at": parse_dt(rec.get("requested_datetime") or rec.get("created_at") or rec.get("createdDate")),
+        "created_at": created_at,
+        "updated_at": updated_at,
         "status": rec.get("status"),
         "status_notes": rec.get("status_notes") or rec.get("statusNotes"),
+        "resolution_notes": rec.get("solved_description")
+        or rec.get("resolution_description")
+        or rec.get("resolution_notes"),
+        "after_action_url": rec.get("after_url") or rec.get("followup_url"),
         "police_district": rec.get("police_district") or rec.get("policeDistrict"),
         "lat": to_num(rec.get("lat") or rec.get("latitude")),
         "lon": to_num(rec.get("long") or rec.get("lon") or rec.get("longitude")),
@@ -200,6 +215,17 @@ def normalize_record(
         "tag_num_people": to_num(tags.get("num_people")),
         "derived_is_private_property": feats.get("kw_private_property", False),
     }
+    out["hours_to_resolution"] = None
+    if created_at and updated_at:
+        try:
+            start = datetime.fromisoformat(created_at)
+            end = datetime.fromisoformat(updated_at)
+            delta = end - start
+            hours = delta.total_seconds() / 3600.0
+            if hours >= 0:
+                out["hours_to_resolution"] = round(hours, 2)
+        except Exception:
+            out["hours_to_resolution"] = None
     if out["tag_size_feet"] is not None:
         out["tag_size_feet"] = max(0.0, min(float(out["tag_size_feet"]), float(size_max)))
     if out["tag_num_people"] is not None:

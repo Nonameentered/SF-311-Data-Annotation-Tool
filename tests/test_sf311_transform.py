@@ -65,3 +65,23 @@ def test_normalize_record_handles_missing_manifest():
     assert row["image_paths"] == [None]
     assert row["image_checksums"] == [None]
     assert row["image_fetch_status"] == [None]
+
+
+def test_normalize_record_tracks_resolution_metadata():
+    rec = {
+        "service_request_id": "789",
+        "description": "Encampment cleared",
+        "requested_datetime": "2024-01-01T08:00:00",
+        "updated_datetime": "2024-01-02T08:00:00",
+        "status": "closed",
+        "status_notes": "Case resolved.",
+        "solved_description": "Follow-up complete",
+        "after_url": "https://example.org/followup",
+    }
+
+    row = sf311_transform.normalize_record(rec, 400.0, {})
+
+    assert row["updated_at"] == "2024-01-02T08:00:00"
+    assert row["resolution_notes"] == "Follow-up complete"
+    assert row["after_action_url"] == "https://example.org/followup"
+    assert row["hours_to_resolution"] == 24.0

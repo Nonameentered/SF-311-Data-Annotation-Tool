@@ -54,6 +54,38 @@ st.title("SF311 Priority Labeler — Human-in-the-Loop")
 
 ShortcutType = Union[str, Sequence[str]]
 
+FEATURE_TIPS: Dict[str, str] = {
+    "lying_face_down": "Report indicates someone is prone or face down on the ground.",
+    "safety_issue": "Flags imminent safety hazards (traffic, violence, weapons).",
+    "drugs": "Evidence of drug use or paraphernalia on scene.",
+    "tents_present": "Tents, makeshift shelters, or similar structures present.",
+    "blocking": "Belongings or people are obstructing the right of way (sidewalk/road).",
+    "on_ramp": "Located on or immediately adjacent to a freeway on/off ramp.",
+    "propane_or_flame": "Propane tanks, open flames, or generators noted.",
+    "children_present": "Children observed at the scene.",
+    "wheelchair": "Wheelchair or mobility device mentioned in the request.",
+    "num_people_bin": "Responder estimate of individuals present (HSOC tag or annotator update).",
+    "size_feet_bin": "Linear footprint in feet from HSOC responders. Use bins to adjust if photos show otherwise.",
+}
+
+LABEL_TIPS: Dict[str, str] = {
+    "priority": "P1 = life-threatening/immediate, P4 = informational only. Priorities should track urgency and resource need.",
+    "confidence": "How certain you are about the assigned priority/features based on available evidence.",
+    "evidence_sources": "Select the sources you relied on (photos, notes, prior history, etc.).",
+    "notes": "Capture rationale, escalation paths, or anomalies for reviewers.",
+    "abstain": "Use when context is insufficient to label confidently.",
+    "needs_review": "Flag items that require supervisor follow-up or contain conflicting info.",
+    "label_status": "Mark `resolved` once the case has been adjudicated or synced into the gold set.",
+}
+
+FIELD_GLOSSARY: Dict[str, str] = {
+    "Priority": LABEL_TIPS["priority"],
+    "size_feet": "`size_feet` is HSOC's estimate of the encampment or belongings footprint in feet. It reflects linear spread, not square footage.",
+    "hours_to_resolution": "Time between the initial request and the last known update/closure.",
+    "status_notes": "311 or responder notes at closure. Often describe remediation or why the case was closed.",
+    "resolution_notes": "Post-closure follow-up notes when provided by HSOC.",
+}
+
 
 def keyboard_button(
     label: str,
@@ -137,6 +169,22 @@ def format_timestamp(value: Any) -> str:
     if value is None:
         return "—"
     return str(value)
+
+
+def format_duration_hours(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        hours = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if hours < 1:
+        minutes = round(hours * 60)
+        return f"{minutes} min"
+    if hours < 48:
+        return f"{round(hours, 1)} h"
+    days = hours / 24.0
+    return f"{round(days, 1)} days"
 
 
 def get_supabase_client() -> Optional[Client]:
@@ -246,6 +294,26 @@ def resolve_images(row: Dict[str, Any]) -> List[Dict[str, Any]]:
             }
         )
     return resolved
+
+
+def rich_context_score(record: Dict[str, Any]) -> float:
+    score = 0.0
+    if record.get("has_photo"):
+        images = record.get("image_urls") or []
+        score += min(len(images), 6) * 1.5
+    if record.get("status_notes"):
+        score += 2.0
+    if record.get("resolution_notes"):
+        score += 1.5
+    if record.get("after_action_url"):
+        score += 1.0
+    if record.get("hours_to_resolution"):
+        score += 1.0
+    if record.get("tag_size_feet"):
+        score += 0.5
+    if record.get("tag_num_people"):
+        score += 0.5
+    return score
 
 
 def record_feature_defaults(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -391,6 +459,7 @@ def subset(
     annotator_uid: str,
     search_text: str = "",
     only_mine: bool = False,
+    require_rich_context: bool = False,
 ) -> List[Dict[str, Any]]:
     def pass_kw(r: Dict[str, Any]) -> bool:
         return all(r.get(f"kw_{k}", False) for k in kw_filters)
@@ -434,6 +503,10 @@ def subset(
             haystack_parts.append(" ".join(str(l.get("notes") or "") for l in labels))
             haystack = " ".join(haystack_parts).lower()
             if search_text not in haystack:
+                continue
+        if require_rich_context:
+            has_context = bool(r.get("has_photo") or r.get("status_notes") or r.get("resolution_notes"))
+            if not has_context:
                 continue
         if only_mine and annotator_uid not in unique_annotators(labels):
             continue
@@ -485,6 +558,9 @@ def main() -> None:
         labels = labels_by_request.get(rid, [])
         status = request_status(labels)
         status_counts[status] = status_counts.get(status, 0) + 1
+    with_images = sum(1 for r in rows_all if r.get("has_photo"))
+    with_notes = sum(1 for r in rows_all if r.get("status_notes"))
+    with_resolution_notes = sum(1 for r in rows_all if r.get("resolution_notes"))
 
     if BACKUP_SETTING is None:
         enable_file_backup = supabase_client is None
@@ -496,6 +572,10 @@ def main() -> None:
         st.write(f"Total requests: {len(rows_all)}")
         for key in ["unlabeled", "needs_review", "conflict", "labeled"]:
             st.write(f"{key.replace('_', ' ').title()}: {status_counts.get(key, 0)}")
+        st.write("—")
+        st.write(f"With photos: {with_images}")
+        st.write(f"With status notes: {with_notes}")
+        st.write(f"With resolution notes: {with_resolution_notes}")
 
     has_photo = st.sidebar.selectbox("Has photo?", ["any", "with photos", "no photos"])
     has_photo = None if has_photo == "any" else (True if has_photo == "with photos" else False)
@@ -515,10 +595,23 @@ def main() -> None:
     )
     st.session_state["queue_search"] = search_text
     only_mine = st.sidebar.checkbox("Only requests I've labeled", value=False)
+    require_rich_context = st.sidebar.checkbox(
+        "Require photos or notes",
+        value=False,
+        help="When enabled, the queue will only include requests that already have photos or 311 responder notes.",
+    )
+    sort_options = [
+        "Rich context first",
+        "Random",
+        "Oldest first",
+        "Newest first",
+        "Request ID",
+    ]
     sort_mode = st.sidebar.selectbox(
         "Sort order",
-        ["Random", "Oldest first", "Newest first", "Request ID"],
+        sort_options,
         index=0,
+        help="Rich context surfaces requests that already have photos, closure notes, or metadata so annotators can move quickly on well-documented cases.",
     )
     seed = st.sidebar.number_input("Random seed", value=42, step=1)
     if st.sidebar.button("Reset queue"):
@@ -538,8 +631,16 @@ def main() -> None:
         annotator_uid=annotator_uid,
         search_text=search_text,
         only_mine=only_mine,
+        require_rich_context=require_rich_context,
     )
-    if sort_mode == "Random":
+    if sort_mode == "Rich context first":
+        rows.sort(
+            key=lambda r: (
+                -rich_context_score(r),
+                parse_created_at(r.get("created_at")) or datetime.max,
+            )
+        )
+    elif sort_mode == "Random":
         random.Random(seed).shuffle(rows)
     elif sort_mode == "Oldest first":
         rows.sort(key=lambda r: parse_created_at(r.get("created_at")) or datetime.max)
@@ -563,10 +664,14 @@ def main() -> None:
     existing_labels = sort_labels(labels_by_request.get(req_id, []))
     current_status = request_status(existing_labels)
 
-    queue_col, progress_col, idx_col = st.columns([2, 2, 1])
+    queue_col, progress_col, idx_col, elapsed_col = st.columns([2, 2, 1, 1])
     queue_col.metric("Queue size", len(rows))
     progress_col.metric("Unique labeled", len([r for r in labels_by_request if labels_by_request[r]]))
     idx_col.metric("Index", f"{idx + 1}/{len(rows)}")
+    elapsed_col.metric(
+        "Resolution time",
+        format_duration_hours(record.get("hours_to_resolution")),
+    )
     st.caption(
         f"Signed in as {annotator_display} ({annotator_role}) — Request status: {current_status}"
     )
@@ -600,14 +705,189 @@ def main() -> None:
                 st.info(f"Showing first 9 images ({len(images)} total)")
 
     with right:
+        st.markdown("#### Label entry")
+        glossary_pairs = list(FIELD_GLOSSARY.items())
+        if hasattr(st, "popover"):
+            with st.popover("ℹ️ Field glossary"):
+                for label, desc in glossary_pairs:
+                    st.markdown(f"**{label}** — {desc}")
+        else:
+            with st.expander("Field glossary", expanded=False):
+                for label, desc in glossary_pairs:
+                    st.markdown(f"**{label}** — {desc}")
+
+        latest_for_user = latest_label_for_annotator(existing_labels, annotator_uid)
+        if latest_for_user and keyboard_button(
+            "Load my last label",
+            shortcuts=["shift+l"],
+            button_type="secondary",
+            use_container_width=True,
+        ):
+            st.session_state["prefill"] = latest_for_user
+            st.rerun()
+
+        prefill = st.session_state.pop("prefill", latest_for_user)
+        prefill_features = coerce_features(prefill) if prefill else {}
+        record_defaults = record_feature_defaults(record)
+        initial_features = {**record_defaults, **prefill_features}
+
+        def prefill_bool(key: str) -> bool:
+            return bool(initial_features.get(key, False))
+
+        def prefill_select(key: str, fallback: str, options: List[str]) -> int:
+            value = initial_features.get(key, fallback)
+            if value not in options:
+                value = fallback
+            return options.index(value)
+
+        prio_options = ["P1", "P2", "P3", "P4"]
+        if prefill and prefill.get("priority") in prio_options:
+            prio_index = prio_options.index(prefill["priority"])
+        else:
+            prio_index = 2
+        prio = st.radio(
+            "Priority",
+            prio_options,
+            horizontal=True,
+            index=prio_index,
+            help=LABEL_TIPS["priority"],
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            lying = st.checkbox(
+                "lying_face_down",
+                value=prefill_bool("lying_face_down"),
+                help=FEATURE_TIPS["lying_face_down"],
+            )
+            safety = st.checkbox(
+                "safety_issue",
+                value=prefill_bool("safety_issue"),
+                help=FEATURE_TIPS["safety_issue"],
+            )
+            drugs = st.checkbox(
+                "drugs",
+                value=prefill_bool("drugs"),
+                help=FEATURE_TIPS["drugs"],
+            )
+        with c2:
+            tents = st.checkbox(
+                "tents_present",
+                value=prefill_bool("tents_present"),
+                help=FEATURE_TIPS["tents_present"],
+            )
+            blocking = st.checkbox(
+                "blocking",
+                value=prefill_bool("blocking"),
+                help=FEATURE_TIPS["blocking"],
+            )
+            onramp = st.checkbox(
+                "on_ramp",
+                value=prefill_bool("on_ramp"),
+                help=FEATURE_TIPS["on_ramp"],
+            )
+        with c3:
+            propane = st.checkbox(
+                "propane_or_flame",
+                value=prefill_bool("propane_or_flame"),
+                help=FEATURE_TIPS["propane_or_flame"],
+            )
+            kids = st.checkbox(
+                "children_present",
+                value=prefill_bool("children_present"),
+                help=FEATURE_TIPS["children_present"],
+            )
+            chair = st.checkbox(
+                "wheelchair",
+                value=prefill_bool("wheelchair"),
+                help=FEATURE_TIPS["wheelchair"],
+            )
+
+        num_people_opts = ["0", "1", "2-3", "4-5", "6+"]
+        num_people_bin = st.selectbox(
+            "num_people_bin",
+            num_people_opts,
+            index=prefill_select("num_people_bin", "1", num_people_opts),
+            help=FEATURE_TIPS["num_people_bin"],
+        )
+        size_opts = ["0", "1-20", "21-80", "81-150", "150+"]
+        size_feet_bin = st.selectbox(
+            "size_feet_bin",
+            size_opts,
+            index=prefill_select("size_feet_bin", "21-80", size_opts),
+            help=FEATURE_TIPS["size_feet_bin"],
+        )
+
+        confidence_opts = ["High", "Medium", "Low"]
+        confidence_default = (
+            prefill.get("confidence") if prefill and prefill.get("confidence") in confidence_opts else "Medium"
+        )
+        confidence = st.selectbox(
+            "Confidence",
+            confidence_opts,
+            index=confidence_opts.index(confidence_default),
+            help=LABEL_TIPS["confidence"],
+        )
+
+        info_source_options = [
+            "Photos",
+            "Description text",
+            "Status notes",
+            "Resolution notes",
+            "Prior labels",
+            "Map/location",
+            "Other external context",
+        ]
+        prefill_sources = (
+            prefill.get("evidence_sources") if prefill else []
+        )
+        valid_sources = [s for s in prefill_sources or [] if s in info_source_options]
+        info_sources = st.multiselect(
+            "Information used",
+            info_source_options,
+            default=valid_sources or ["Photos"] if record.get("has_photo") else valid_sources,
+            help=LABEL_TIPS["evidence_sources"],
+        )
+
+        abstain = st.checkbox(
+            "Abstain (not sure)",
+            value=bool(prefill.get("abstain")) if prefill else False,
+            help=LABEL_TIPS["abstain"],
+        )
+        needs_review = st.checkbox(
+            "Flag for review",
+            value=bool(prefill.get("needs_review")) if prefill else False,
+            help=LABEL_TIPS["needs_review"],
+        )
+        label_status = st.selectbox(
+            "Label status",
+            ["pending", "resolved"],
+            index=0 if not prefill or prefill.get("status") != "resolved" else 1,
+            help=LABEL_TIPS["label_status"],
+        )
+        notes_val = prefill.get("notes") if prefill else ""
+        notes = st.text_area(
+            "Notes (optional)",
+            value=notes_val or "",
+            height=90,
+            help=LABEL_TIPS["notes"],
+        )
+
+        st.divider()
         st.markdown("#### Context & History")
         keywords = [k.replace('kw_', '') for k in record.keys() if k.startswith('kw_') and record[k]]
         summary_tab, history_tab, raw_tab = st.tabs(["Summary", "Annotation history", "Raw data"])
 
         with summary_tab:
+            status_value = record.get("status") or "—"
+            status_lower = str(record.get("status") or "").lower()
+            closed_states = {"closed", "completed", "resolved"}
+            status_state = "Closed" if status_lower in closed_states else "Open"
             summary_rows = [
                 ("Created", format_timestamp(record.get("created_at"))),
-                ("Status", record.get("status") or "—"),
+                ("Updated", format_timestamp(record.get("updated_at"))),
+                ("Status", f"{status_value} ({status_state})" if status_value != "—" else status_value),
+                ("Resolution time", format_duration_hours(record.get("hours_to_resolution"))),
                 ("District", record.get("police_district") or "—"),
                 (
                     "Neighborhood",
@@ -615,6 +895,8 @@ def main() -> None:
                 ),
                 ("Service subtype", record.get("service_subtype") or "—"),
                 ("Status notes", record.get("status_notes") or "—"),
+                ("Resolution notes", record.get("resolution_notes") or "—"),
+                ("After action", record.get("after_action_url") or "—"),
                 ("Location", f"{record.get('lat')}, {record.get('lon')}")
                 if record.get("lat") and record.get("lon")
                 else ("Location", "—"),
@@ -647,6 +929,8 @@ def main() -> None:
                             or "—",
                             "priority": entry.get("priority")
                             or entry.get("labels", {}).get("priority"),
+                            "confidence": entry.get("confidence") or "",
+                            "evidence": ", ".join(entry.get("evidence_sources") or []),
                             "status": entry.get("status")
                             or ("needs_review" if entry.get("needs_review") else "pending"),
                             "notes": entry.get("notes") or "",
@@ -668,81 +952,6 @@ def main() -> None:
                 st.json(images)
             with raw_labels_tab:
                 st.json(existing_labels)
-
-        st.divider()
-        st.markdown("#### Label entry")
-
-        latest_for_user = latest_label_for_annotator(existing_labels, annotator_uid)
-        if latest_for_user and keyboard_button(
-            "Load my last label",
-            shortcuts=["shift+l"],
-            button_type="secondary",
-            use_container_width=True,
-        ):
-            st.session_state["prefill"] = latest_for_user
-            st.rerun()
-
-        prefill = st.session_state.pop("prefill", latest_for_user)
-        prefill_features = coerce_features(prefill) if prefill else {}
-        record_defaults = record_feature_defaults(record)
-        initial_features = {**record_defaults, **prefill_features}
-
-        def prefill_bool(key: str) -> bool:
-            return bool(initial_features.get(key, False))
-
-        def prefill_select(key: str, fallback: str, options: List[str]) -> int:
-            value = initial_features.get(key, fallback)
-            if value not in options:
-                value = fallback
-            return options.index(value)
-
-        prio_options = ["P1", "P2", "P3", "P4"]
-        if prefill and prefill.get("priority") in prio_options:
-            prio_index = prio_options.index(prefill["priority"])
-        else:
-            prio_index = 2
-        prio = st.radio("Priority", prio_options, horizontal=True, index=prio_index)
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            lying = st.checkbox("lying_face_down", value=prefill_bool("lying_face_down"))
-            safety = st.checkbox("safety_issue", value=prefill_bool("safety_issue"))
-            drugs = st.checkbox("drugs", value=prefill_bool("drugs"))
-        with c2:
-            tents = st.checkbox("tents_present", value=prefill_bool("tents_present"))
-            blocking = st.checkbox("blocking", value=prefill_bool("blocking"))
-            onramp = st.checkbox("on_ramp", value=prefill_bool("on_ramp"))
-        with c3:
-            propane = st.checkbox("propane_or_flame", value=prefill_bool("propane_or_flame"))
-            kids = st.checkbox("children_present", value=prefill_bool("children_present"))
-            chair = st.checkbox("wheelchair", value=prefill_bool("wheelchair"))
-
-        num_people_opts = ["0", "1", "2-3", "4-5", "6+"]
-        num_people_bin = st.selectbox(
-            "num_people_bin",
-            num_people_opts,
-            index=prefill_select("num_people_bin", "1", num_people_opts),
-        )
-        size_opts = ["0", "1-20", "21-80", "81-150", "150+"]
-        size_feet_bin = st.selectbox(
-            "size_feet_bin",
-            size_opts,
-            index=prefill_select("size_feet_bin", "21-80", size_opts),
-        )
-
-        abstain = st.checkbox(
-            "Abstain (not sure)", value=bool(prefill.get("abstain")) if prefill else False
-        )
-        needs_review = st.checkbox(
-            "Flag for review", value=bool(prefill.get("needs_review")) if prefill else False
-        )
-        label_status = st.selectbox(
-            "Label status",
-            ["pending", "resolved"],
-            index=0 if not prefill or prefill.get("status") != "resolved" else 1,
-        )
-        notes_val = prefill.get("notes") if prefill else ""
-        notes = st.text_area("Notes (optional)", value=notes_val or "", height=80)
 
     col_prev, col_save, col_skip = st.columns([1, 1, 1])
 
@@ -789,6 +998,8 @@ def main() -> None:
                 "needs_review": bool(needs_review),
                 "status": label_status,
                 "notes": notes.strip() or None,
+                "confidence": confidence,
+                "evidence_sources": info_sources,
                 "image_paths": record.get("image_paths"),
                 "image_checksums": record.get("image_checksums"),
                 "revision_of": prefill.get("label_id") if prefill else None,
