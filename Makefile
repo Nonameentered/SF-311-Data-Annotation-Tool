@@ -22,15 +22,6 @@ help: ## Show this help
 .PHONY: all
 all: transform audit eval ## Run transform → audit → eval (full pipeline)
 
-.PHONY: init
-init: ## Initialize project with uv and add runtime + dev dependencies
-	$(call _header,Init project)
-	-$(UV) init .
-	$(UV) python install $(PYTHON_VER)
-	$(UV) python pin $(PYTHON_VER)
-	$(UV) add pandas pyarrow rich streamlit
-	$(UV) add --dev ruff black pytest
-	$(UV) sync
 
 .PHONY: sync
 sync: ## Sync environment from pyproject/uv.lock
@@ -96,3 +87,7 @@ sample: ## Create a tiny sample JSONL from transformed data (first 50 rows)
 	$(call _header,Sample)
 	head -n 50 $(OUT_JSONL) > data/sample.jsonl
 	@echo "Wrote data/sample.jsonl"
+
+.PHONY: codex
+codex:
+	@codex -m gpt-5-codex -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox

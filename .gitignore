@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# UV-related
+uv.lock
+
+# MacOS
+.DS_Store

@@ -1,6 +1,0 @@
-data/*
-!data/README.md
-!data/fixtures/*
-.venv/
-uv.lock
-.DS_Store
