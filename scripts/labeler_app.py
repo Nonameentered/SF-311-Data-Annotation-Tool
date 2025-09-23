@@ -38,6 +38,8 @@ from scripts.labeler_utils import (
     unique_annotators,
 )
 
+APP_TITLE = "SF311 Priority Labeler — Human-in-the-Loop"
+
 
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     try:
@@ -125,8 +127,23 @@ SUPABASE_URL = get_secret("SUPABASE_URL")
 SUPABASE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY") or get_secret("SUPABASE_ANON_KEY")
 BACKUP_SETTING = get_secret("LABELS_JSONL_BACKUP")
 
-st.set_page_config(page_title="SF311 Priority Labeler", layout="wide")
-st.title("SF311 Priority Labeler — Human-in-the-Loop")
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 0.8rem !important;
+        padding-bottom: 1.6rem !important;
+    }
+    iframe[src*="streamlit_browser_storage"] {
+        display: none !important;
+        height: 0 !important;
+        margin: 0 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 ShortcutType = Union[str, Sequence[str]]
 
