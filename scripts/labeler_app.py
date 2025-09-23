@@ -185,30 +185,51 @@ def keyboard_button(
     shortcuts: ShortcutType | None = None,
     *,
     button_type: str = "secondary",
-    use_container_width: bool = False,
+    width: str = "content",
     key: Optional[str] = None,
     help: Optional[str] = None,
 ) -> bool:
     """Render a button with optional keyboard shortcuts."""
 
     if shortcuts and shortcut_button is not None:
-        return shortcut_button(
+        try:
+            return shortcut_button(
+                label,
+                shortcuts,
+                None,
+                key=key,
+                help=help,
+                type=button_type,
+                width=width,
+                hint=True,
+            )
+        except TypeError:
+            return shortcut_button(
+                label,
+                shortcuts,
+                None,
+                key=key,
+                help=help,
+                type=button_type,
+                use_container_width=width == "stretch",
+                hint=True,
+            )
+    try:
+        return st.button(
             label,
-            shortcuts,
-            None,
             key=key,
             help=help,
             type=button_type,
-            use_container_width=use_container_width,
-            hint=True,
+            width=width,
         )
-    return st.button(
-        label,
-        key=key,
-        help=help,
-        type=button_type,
-        use_container_width=use_container_width,
-    )
+    except TypeError:
+        return st.button(
+            label,
+            key=key,
+            help=help,
+            type=button_type,
+            use_container_width=width == "stretch",
+        )
 
 
 def parse_created_at(value: Any) -> Optional[datetime]:
@@ -794,24 +815,50 @@ def main() -> None:
     existing_labels = sort_labels(labels_by_request.get(req_id, []))
     current_status = request_status(existing_labels)
 
-    with st.container():
-        queue_col, progress_col, idx_col, elapsed_col = st.columns([2, 2, 1, 1])
-        queue_col.metric("Queue size", len(rows))
-        progress_col.metric(
-            "Unique labeled",
-            len([r for r in labels_by_request if labels_by_request[r]]),
-        )
-        idx_col.metric("Index", f"{idx + 1}/{len(rows)}")
-        elapsed_col.metric(
-            "Time to resolution",
-            format_duration_hours(record.get("hours_to_resolution")),
-        )
+    prev_clicked = False
+    save_clicked = False
+    skip_clicked = False
+
+    summary_col, action_col = st.columns([3, 1.6])
+    with summary_col:
         st.caption(
-            f"Signed in as {annotator_display} ({annotator_role}) — Request status: {current_status}"
+            f"Queue {len(rows)} · Labeled {len([r for r in labels_by_request if labels_by_request[r]])} · "
+            f"Index {idx + 1}/{len(rows)} · Time to resolution {format_duration_hours(record.get('hours_to_resolution'))}"
         )
         st.markdown(
             f"**Case snapshot:** {status_badge(record)} · {outcome_highlight(record)}"
         )
+
+    with action_col:
+        btn_prev, btn_save, btn_skip = st.columns([1, 1.3, 1])
+
+        with btn_prev:
+            if keyboard_button(
+                "Prev",
+                shortcuts=["shift+left", "alt+left"],
+                width="stretch",
+                key="nav-prev",
+            ):
+                prev_clicked = True
+
+        with btn_save:
+            if keyboard_button(
+                "Save & Next",
+                shortcuts=["ctrl+enter", "cmd+enter"],
+                button_type="primary",
+                width="stretch",
+                key="nav-save",
+            ):
+                save_clicked = True
+
+        with btn_skip:
+            if keyboard_button(
+                "Skip",
+                shortcuts=["shift+right", "alt+right"],
+                width="stretch",
+                key="nav-skip",
+            ):
+                skip_clicked = True
 
     images = resolve_images(record)
 
@@ -858,7 +905,7 @@ def main() -> None:
             "Load my last label",
             shortcuts=["shift+l"],
             button_type="secondary",
-            use_container_width=True,
+            width="stretch",
         ):
             st.session_state["prefill"] = latest_for_user
             st.rerun()
@@ -888,6 +935,14 @@ def main() -> None:
             horizontal=True,
             index=prio_index,
             help=LABEL_TIPS["priority"],
+        )
+
+        notes_val = prefill.get("notes") if prefill else ""
+        notes = st.text_area(
+            "Notes",
+            value=notes_val or "",
+            height=110,
+            help=LABEL_TIPS["notes"],
         )
 
         c1, c2, c3 = st.columns(3)
@@ -1006,13 +1061,6 @@ def main() -> None:
             index=0 if not prefill or prefill.get("status") != "resolved" else 1,
             help=LABEL_TIPS["label_status"],
         )
-        notes_val = prefill.get("notes") if prefill else ""
-        notes = st.text_area(
-            "Notes (optional)",
-            value=notes_val or "",
-            height=90,
-            help=LABEL_TIPS["notes"],
-        )
 
         st.markdown("#### Status & Notes")
         st.markdown(f"**Case status:** {status_badge(record)}")
@@ -1112,63 +1160,70 @@ def main() -> None:
         if keyboard_button(
             "Prev",
             shortcuts=["shift+left", "alt+left"],
-            use_container_width=True,
+            width="stretch",
         ):
-            st.session_state.idx = max(idx - 1, 0)
-            st.rerun()
+            prev_clicked = True
 
     with col_save:
         if keyboard_button(
             "Save & Next",
             shortcuts=["ctrl+enter", "cmd+enter"],
             button_type="primary",
-            use_container_width=True,
+            width="stretch",
         ):
-            label_id = str(uuid.uuid4())
-            payload = {
-                "label_id": label_id,
-                "request_id": req_id,
-                "annotator_uid": annotator_uid,
-                "annotator": annotator_display,
-                "annotator_display": annotator_display,
-                "role": annotator_role,
-                "timestamp": datetime.utcnow().isoformat(),
-                "priority": prio,
-                "features": {
-                    "lying_face_down": lying,
-                    "safety_issue": safety,
-                    "drugs": drugs,
-                    "tents_present": tents,
-                    "blocking": blocking,
-                    "on_ramp": onramp,
-                    "propane_or_flame": propane,
-                    "children_present": kids,
-                    "wheelchair": chair,
-                    "num_people_bin": num_people_bin,
-                    "size_feet_bin": size_feet_bin,
-                },
-                "abstain": bool(abstain),
-                "needs_review": bool(needs_review),
-                "status": label_status,
-                "notes": notes.strip() or None,
-                "confidence": confidence,
-                "evidence_sources": info_sources,
-                "image_paths": record.get("image_paths"),
-                "image_checksums": record.get("image_checksums"),
-                "revision_of": prefill.get("label_id") if prefill else None,
-            }
-            save_label(payload, supabase_client, enable_file_backup)
-            st.session_state.idx = min(idx + 1, len(rows) - 1)
-            st.rerun()
+            save_clicked = True
 
     with col_skip:
         if keyboard_button(
             "Skip",
             shortcuts=["shift+right", "alt+right"],
-            use_container_width=True,
+            width="stretch",
         ):
-            st.session_state.idx = min(idx + 1, len(rows) - 1)
-            st.rerun()
+            skip_clicked = True
+
+    if prev_clicked:
+        st.session_state.idx = max(idx - 1, 0)
+        st.rerun()
+    elif save_clicked:
+        label_id = str(uuid.uuid4())
+        payload = {
+            "label_id": label_id,
+            "request_id": req_id,
+            "annotator_uid": annotator_uid,
+            "annotator": annotator_display,
+            "annotator_display": annotator_display,
+            "role": annotator_role,
+            "timestamp": datetime.utcnow().isoformat(),
+            "priority": prio,
+            "features": {
+                "lying_face_down": lying,
+                "safety_issue": safety,
+                "drugs": drugs,
+                "tents_present": tents,
+                "blocking": blocking,
+                "on_ramp": onramp,
+                "propane_or_flame": propane,
+                "children_present": kids,
+                "wheelchair": chair,
+                "num_people_bin": num_people_bin,
+                "size_feet_bin": size_feet_bin,
+            },
+            "abstain": bool(abstain),
+            "needs_review": bool(needs_review),
+            "status": label_status,
+            "notes": notes.strip() or None,
+            "confidence": confidence,
+            "evidence_sources": info_sources,
+            "image_paths": record.get("image_paths"),
+            "image_checksums": record.get("image_checksums"),
+            "revision_of": prefill.get("label_id") if prefill else None,
+        }
+        save_label(payload, supabase_client, enable_file_backup)
+        st.session_state.idx = min(idx + 1, len(rows) - 1)
+        st.rerun()
+    elif skip_clicked:
+        st.session_state.idx = min(idx + 1, len(rows) - 1)
+        st.rerun()
 
 
 if __name__ == "__main__":
