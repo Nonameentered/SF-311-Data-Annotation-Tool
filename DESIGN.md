@@ -22,9 +22,9 @@ Stand up an image-first labeling workflow for SF311 homelessness reports so we c
    - Add pytest coverage for schema + checksum expectations (e.g., `tests/test_transform.py`).
 4. **Label Collection (Streamlit)**
    - `make labeler` launches `scripts/labeler_app.py`.
-   - Primary auth path: Supabase email/password (self-serve sign-up, email verification). Provide `SUPABASE_URL` + `SUPABASE_ANON_KEY`/`SUPABASE_SERVICE_ROLE_KEY` via env vars. File-based auth remains as a local fallback.
+   - Supabase email/password (self-serve sign-up, email verification) is required. Provide `SUPABASE_URL` + `SUPABASE_ANON_KEY`/`SUPABASE_SERVICE_ROLE_KEY` via env vars before launching.
    - Enforces a cap of three distinct annotators per request; individuals can load/revise their prior submission, flag items for review, and set label status (`pending`/`resolved`).
-   - Saves events into a Supabase `labels` table (JSON payload) and optionally mirrors to per-day JSONL backups (`data/labels/{date}/labels.jsonl`). In production set `LABELS_JSONL_BACKUP=0` to disable local copies.
+   - Saves events into a Supabase `labels` table (JSON payload) and optionally mirrors to per-day JSONL backups (`data/labels/{date}/labels.jsonl`). Set `LABELS_JSONL_BACKUP=1` to enable the mirror when desired.
    - Bounding boxes are postponed; design keeps room to plug `streamlit-drawable-canvas` later.
 5. **Gold Set Assembly**
    - CLI (`scripts/label_ops.py`, future) merges verified labels with transformed rows, resolves conflicts, and materializes evaluation splits under `data/eval/v1/`.
@@ -69,12 +69,13 @@ Future optional fields: `bounding_boxes`.
 Supabase table (`labels`) should mirror the schema above (JSONB column for `features`, TEXT for IDs, BOOLEAN flags). Set row-level security or policies to allow authenticated users to insert/select their own rows while reviewers can read all.
 
 ## Streamlit Application Requirements
-- **Layout**: image gallery (max 9 photos) takes majority width; textual context + auto-tags + metadata on the side.
+- **Layout**: balanced grid where images (max 9 photos) share the screen with decision/status cards so annotators see visuals and outcomes without scrolling.
 - **Queue controls**: filters on photos/no photos, keywords, derived tags, and request status (`unlabeled`, `needs_review`, `conflict`, `labeled`). Deterministic seeding keeps the queue predictable.
 - **Auth & Roles**: login form backed by `config/annotators.json` (overridable via env var). Annotator identity is fixed for the session and stored with every label event.
 - **Persistence**: labels append to per-day JSONL logs (`data/labels/YYYYMMDD/labels.jsonl`). Each event includes a `label_id`, `revision_of`, and status flags to support reconciliation.
 - **Resilience**: handle missing images gracefully (show placeholders, surface fetch errors), allow keyboard-enabled navigation.
 - **Metrics**: surface counts for queue size, total labeled requests, conflicts, and per-status tallies.
+- **Planned upgrades**: see `docs/labeler_improvement_plan.md` for the snapshot ribbon, decision/status cards, outcome tags, and review workflow roadmap.
 
 ## Dataset Monitoring
 - Save audit snapshots (`data/audit/{timestamp}.json`) capturing counts of requests, photo coverage, keyword frequencies, district distribution.

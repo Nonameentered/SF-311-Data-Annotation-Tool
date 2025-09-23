@@ -3,7 +3,7 @@
 ## 1. Supabase Project Setup
 1. Create a new Supabase project and enable **Email/Password** sign-in (Auth → Providers).
 2. In Auth → Email Templates, keep the default confirmation email so new annotators verify themselves.
-3. Open the SQL Editor, copy the contents of [`supabase/labels_table.sql`](../supabase/labels_table.sql), and execute them to create the table plus policies. (CLI alternative: `supabase db remote commit --file supabase/labels_table.sql`.)
+3. Open the SQL Editor, copy the contents of the migrations under `supabase/migrations/` (or run `supabase db push`) to create the tables and policies. The initial migrations are idempotent, so running them multiple times is safe.
 4. (Optional) Add a `reviewer` role claim to any supervisor accounts via Auth → Users → Edit user metadata (`{"role": "reviewer"}`) so they can see all labels.
 
 ## 2. Secrets & Environment Variables
@@ -50,4 +50,4 @@ Make sure your repository secrets supply the Supabase keys and any other credent
 - Schedule the GitHub Actions workflow (already configured) to keep transformed data and audit snapshots fresh.
 - Use Supabase SQL or the Dashboard to reconcile conflicts and export gold splits (e.g., `COPY (SELECT * FROM labels WHERE status = 'resolved') TO ...`).
 - Monitor Supabase auth logs and storage metrics. Consider enabling Row Level Security logs for auditing annotator activity.
-- Keep `supabase/labels_table.sql` in sync with schema changes; rerun it (safe due to `create if not exists`) whenever you add columns or adjust policies.
+- Keep the migrations under `supabase/migrations/` in sync with schema changes; run `supabase db push` whenever you add columns or adjust policies.

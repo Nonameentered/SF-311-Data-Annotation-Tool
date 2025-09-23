@@ -19,13 +19,15 @@ create table if not exists public.labels (
 
 alter table public.labels enable row level security;
 
-create policy if not exists "labels_insert_own"
+drop policy if exists "labels_insert_own" on public.labels;
+create policy "labels_insert_own"
     on public.labels
     for insert
     to authenticated
     with check (auth.uid() = annotator_uid);
 
-create policy if not exists "labels_select_own_or_reviewer"
+drop policy if exists "labels_select_own_or_reviewer" on public.labels;
+create policy "labels_select_own_or_reviewer"
     on public.labels
     for select
     to authenticated
@@ -34,7 +36,8 @@ create policy if not exists "labels_select_own_or_reviewer"
         or coalesce(auth.jwt()->>'role', '') = 'reviewer'
     );
 
-create policy if not exists "labels_update_own"
+drop policy if exists "labels_update_own" on public.labels;
+create policy "labels_update_own"
     on public.labels
     for update
     to authenticated

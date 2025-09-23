@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
+from streamlit_browser_storage import LocalStorage
 
 try:
     from supabase import Client, create_client
@@ -34,20 +36,94 @@ from scripts.labeler_utils import (
     request_status,
     sort_labels,
     unique_annotators,
-    verify_password,
 )
 
-DATA = Path(os.environ.get("LABELER_DATA_DIR", "data"))
+
+def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    try:
+        secrets_obj = dict(st.secrets)  # type: ignore[arg-type]
+    except StreamlitSecretNotFoundError:
+        secrets_obj = {}
+    except Exception:
+        secrets_obj = {}
+    value = secrets_obj.get(key, default)
+    return str(value) if value is not None else None
+
+
+SESSION_STORAGE = LocalStorage(key="supabase_session")
+SESSION_TOKEN_NAME = "session_tokens"
+STATE_TOKEN_KEY = "sb_tokens"
+STATE_TOKEN_TRIES = "sb_token_load_tries"
+
+
+def load_tokens_from_storage() -> Optional[Dict[str, str]]:
+    tokens = st.session_state.get(STATE_TOKEN_KEY)
+    if isinstance(tokens, dict) and tokens.get("access_token") and tokens.get("refresh_token"):
+        st.session_state[STATE_TOKEN_TRIES] = 0
+        return tokens
+    try:
+        stored = SESSION_STORAGE.get(SESSION_TOKEN_NAME)
+    except Exception:
+        stored = None
+    if isinstance(stored, dict) and stored.get("access_token") and stored.get("refresh_token"):
+        st.session_state[STATE_TOKEN_KEY] = stored
+        st.session_state[STATE_TOKEN_TRIES] = 0
+        return stored
+    st.session_state[STATE_TOKEN_TRIES] = st.session_state.get(STATE_TOKEN_TRIES, 0) + 1
+    return None
+
+
+def save_tokens(access_token: str, refresh_token: str) -> None:
+    tokens = {"access_token": access_token, "refresh_token": refresh_token}
+    st.session_state[STATE_TOKEN_KEY] = tokens
+    st.session_state[STATE_TOKEN_TRIES] = 0
+    try:
+        SESSION_STORAGE.set(SESSION_TOKEN_NAME, tokens)
+    except Exception:
+        pass
+
+
+def clear_tokens() -> None:
+    st.session_state.pop(STATE_TOKEN_KEY, None)
+    st.session_state[STATE_TOKEN_TRIES] = 0
+    try:
+        SESSION_STORAGE.delete(SESSION_TOKEN_NAME)
+    except Exception:
+        pass
+
+
+def restore_supabase_session(client: Client) -> None:  # pragma: no cover - requires Supabase
+    tokens = load_tokens_from_storage()
+    if not tokens:
+        return
+    try:
+        session_result = client.auth.set_session(tokens["access_token"], tokens["refresh_token"])
+        current = session_result.session if session_result else client.auth.get_session()
+        if current and current.access_token and current.refresh_token:
+            save_tokens(current.access_token, current.refresh_token)
+        if "sb_session" not in st.session_state:
+            user_resp = client.auth.get_user()
+            user = getattr(user_resp, "user", None)
+            if user is not None:
+                metadata = getattr(user, "user_metadata", {}) or {}
+                profile = {
+                    "id": user.id,
+                    "email": user.email,
+                    "name": metadata.get("display_name") or user.email,
+                    "role": metadata.get("role", "annotator"),
+                }
+                st.session_state["sb_session"] = profile
+    except Exception:
+        clear_tokens()
+
+
+DATA = Path(get_secret("LABELER_DATA_DIR", "data"))
 RAW = DATA / "transformed.jsonl"
-LABELS_DIR = Path(os.environ.get("LABELS_OUTPUT_DIR", DATA / "labels"))
-USERS_FILE = Path(os.environ.get("LABELER_USERS_FILE", "config/annotators.json"))
-MAX_ANNOTATORS = int(os.environ.get("MAX_ANNOTATORS_PER_REQUEST", "3"))
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = (
-    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    or os.environ.get("SUPABASE_ANON_KEY")
-)
-BACKUP_SETTING = os.environ.get("LABELS_JSONL_BACKUP")
+LABELS_DIR = Path(get_secret("LABELS_OUTPUT_DIR", str(DATA / "labels")))
+MAX_ANNOTATORS = int(get_secret("MAX_ANNOTATORS_PER_REQUEST", "3"))
+SUPABASE_URL = get_secret("SUPABASE_URL")
+SUPABASE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY") or get_secret("SUPABASE_ANON_KEY")
+BACKUP_SETTING = get_secret("LABELS_JSONL_BACKUP")
 
 st.set_page_config(page_title="SF311 Priority Labeler", layout="wide")
 st.title("SF311 Priority Labeler — Human-in-the-Loop")
@@ -191,37 +267,17 @@ def get_supabase_client() -> Optional[Client]:
     if not SUPABASE_URL or not SUPABASE_KEY or create_client is None:
         return None
     try:
-        return create_client(SUPABASE_URL, SUPABASE_KEY)
+        client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        restore_supabase_session(client)
+        return client
     except Exception:
         st.error("Failed to initialize Supabase client. Falling back to file storage.")
         return None
 
 
-@st.cache_data
-def load_all_labels(base_dir: str) -> Dict[str, List[Dict[str, Any]]]:
-    base = Path(base_dir)
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    if not base.exists():
-        return out
-    for path in base.rglob("*.jsonl"):
-        try:
-            with path.open(encoding="utf-8") as f:
-                for line in f:
-                    s = line.strip()
-                    if not s:
-                        continue
-                    rec = json.loads(s)
-                    rid = rec.get("request_id")
-                    if rid is None:
-                        continue
-                    rec["features"] = coerce_features(rec)
-                    out.setdefault(str(rid), []).append(rec)
-        except Exception:
-            continue
-    return out
-
-
-def load_labels_supabase(client: Client) -> Dict[str, List[Dict[str, Any]]]:  # pragma: no cover - requires Supabase
+def load_labels_supabase(
+    client: Client,
+) -> Dict[str, List[Dict[str, Any]]]:  # pragma: no cover - requires Supabase
     out: Dict[str, List[Dict[str, Any]]] = {}
     try:
         resp = client.table("labels").select("*").execute()
@@ -240,16 +296,6 @@ def load_labels_supabase(client: Client) -> Dict[str, List[Dict[str, Any]]]:  # 
     return out
 
 
-@st.cache_data
-def load_users(path: str) -> Dict[str, Dict[str, Any]]:
-    p = Path(path)
-    if not p.exists():
-        st.warning("Users file missing; defaulting to open annotator mode")
-        return {}
-    data = json.loads(p.read_text(encoding="utf-8"))
-    return {u["id"]: u for u in data.get("users", []) if "id" in u}
-
-
 def todays_label_file() -> Path:
     day = datetime.utcnow().strftime("%Y%m%d")
     run_dir = LABELS_DIR / day
@@ -258,15 +304,14 @@ def todays_label_file() -> Path:
 
 
 def save_label(
-    payload: Dict[str, Any], supabase_client: Optional[Client], enable_file_backup: bool
+    payload: Dict[str, Any], supabase_client: Client, enable_file_backup: bool
 ) -> None:
-    if supabase_client is not None:  # pragma: no cover - requires Supabase
-        try:
-            supabase_client.table("labels").insert(payload).execute()
-        except Exception as exc:
-            st.error(f"Failed to write label to Supabase: {exc}")
-            return
-    if enable_file_backup or supabase_client is None:
+    try:  # pragma: no cover - requires Supabase
+        supabase_client.table("labels").insert(payload).execute()
+    except Exception as exc:
+        st.error(f"Failed to write label to Supabase: {exc}")
+        return
+    if enable_file_backup:
         target = todays_label_file()
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("a", encoding="utf-8") as f:
@@ -314,6 +359,34 @@ def rich_context_score(record: Dict[str, Any]) -> float:
     if record.get("tag_num_people"):
         score += 0.5
     return score
+
+
+def status_badge(record: Dict[str, Any]) -> str:
+    status_raw = str(record.get("status") or "Unknown").strip()
+    closed_states = {"closed", "completed", "resolved"}
+    if status_raw.lower() in closed_states:
+        return f"🔴 {status_raw.title()}"
+    if status_raw.lower() in {"open", "assigned", "in progress"}:
+        return f"🟢 {status_raw.title()}"
+    return f"🟡 {status_raw.title()}"
+
+
+def outcome_highlight(record: Dict[str, Any]) -> str:
+    status = str(record.get("status") or "Status unknown").strip()
+    duration = record.get("hours_to_resolution")
+    parts: List[str] = []
+    if status:
+        parts.append(status.title())
+    if duration is not None:
+        parts.append(f"after {format_duration_hours(duration)}")
+    summary = " ".join(parts) if parts else "Status unknown"
+    notes = record.get("status_notes") or record.get("resolution_notes")
+    if notes:
+        trimmed = notes.strip().replace("\n", " ")
+        if len(trimmed) > 120:
+            trimmed = trimmed[:117].rstrip() + "…"
+        summary += f" → {trimmed}"
+    return summary
 
 
 def record_feature_defaults(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -364,34 +437,26 @@ def record_feature_defaults(record: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in defaults.items() if v is not None}
 
 
-def authenticate(users: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not users:
-        username = st.text_input("Annotator ID", value=st.session_state.get("annotator_id", ""))
-        st.session_state["annotator_id"] = username.strip()
-        if username.strip():
-            return {"id": username.strip(), "name": username.strip(), "role": "annotator"}
-        st.stop()
-    if "user" in st.session_state:
-        return st.session_state["user"]
-    with st.form("login_form", clear_on_submit=False):
-        st.subheader("Sign in")
-        username = st.text_input("Annotator ID")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login", type="primary")
-        if submitted:
-            user = users.get(username)
-            if user and verify_password(password, user.get("password_hash", "")):
-                st.session_state["user"] = user
-                return user
-            st.error("Invalid credentials")
-    st.stop()
-    return None
-
-
-def authenticate_supabase(client: Client) -> Optional[Dict[str, Any]]:  # pragma: no cover - requires Supabase
+def authenticate_supabase(
+    client: Client,
+) -> Optional[Dict[str, Any]]:  # pragma: no cover - requires Supabase
     session = st.session_state.get("sb_session")
     if session:
         return session
+
+    if st.session_state.get(STATE_TOKEN_TRIES, 0) == 1:
+        st.info("Restoring session…")
+        st.stop()
+
+    notice = st.session_state.pop("sb_notice", None)
+    if notice:
+        level, message = notice
+        if level == "success":
+            st.success(message)
+        elif level == "error":
+            st.error(message)
+        else:
+            st.info(message)
 
     tab_login, tab_signup = st.tabs(["Sign in", "Sign up"])
 
@@ -403,15 +468,22 @@ def authenticate_supabase(client: Client) -> Optional[Dict[str, Any]]:  # pragma
             submitted = st.form_submit_button("Sign in", type="primary")
             if submitted:
                 try:
-                    result = client.auth.sign_in_with_password({"email": email.strip(), "password": password})
+                    result = client.auth.sign_in_with_password(
+                        {"email": email.strip(), "password": password}
+                    )
                     user = result.user
                     if user is None:
-                        st.error("Sign in failed. Check credentials or verify your email.")
+                        st.error(
+                            "Sign in failed. Check credentials or verify your email."
+                        )
                     else:
+                        if result.session and result.session.access_token and result.session.refresh_token:
+                            save_tokens(result.session.access_token, result.session.refresh_token)
                         profile = {
                             "id": user.id,
                             "email": user.email,
-                            "name": user.user_metadata.get("display_name") or user.email,
+                            "name": user.user_metadata.get("display_name")
+                            or user.email,
                             "role": user.user_metadata.get("role", "annotator"),
                         }
                         st.session_state["sb_session"] = profile
@@ -424,7 +496,9 @@ def authenticate_supabase(client: Client) -> Optional[Dict[str, Any]]:  # pragma
         with st.form("supabase_signup"):
             email = st.text_input("Email", key="signup_email")
             password = st.text_input("Password", type="password", key="signup_password")
-            display_name = st.text_input("Display name (shown in app)", key="signup_display_name")
+            display_name = st.text_input(
+                "Display name (shown in app)", key="signup_display_name"
+            )
             submitted = st.form_submit_button("Sign up")
             if submitted:
                 try:
@@ -432,14 +506,38 @@ def authenticate_supabase(client: Client) -> Optional[Dict[str, Any]]:  # pragma
                         {
                             "email": email.strip(),
                             "password": password,
-                            "options": {"data": {"display_name": display_name.strip(), "role": "annotator"}},
+                            "options": {
+                                "data": {
+                                    "display_name": display_name.strip(),
+                                    "role": "annotator",
+                                }
+                            },
                         }
                     )
                     user = result.user
-                    if user is None:
-                        st.info("Check your email to complete registration, then sign in.")
+                    session_resp = getattr(result, "session", None)
+                    email_confirmed = False
+                    if session_resp and getattr(session_resp, "access_token", None):
+                        email_confirmed = True
+                    if user is not None and getattr(user, "email_confirmed_at", None):
+                        email_confirmed = True
+
+                    if not email_confirmed:
+                        st.session_state["sb_notice"] = (
+                            "info",
+                            "Verification email sent. Confirm your address, then return to sign in.",
+                        )
+                        st.rerun()
                     else:
-                        st.success("Account created. Please sign in.")
+                        if result.session and result.session.access_token and result.session.refresh_token:
+                            save_tokens(
+                                result.session.access_token,
+                                result.session.refresh_token,
+                            )
+                        st.session_state["sb_notice"] = (
+                            "success",
+                            "Account created. You can sign in now.",
+                        )
                         st.rerun()
                 except Exception as exc:
                     st.error(f"Sign up error: {exc}")
@@ -505,7 +603,9 @@ def subset(
             if search_text not in haystack:
                 continue
         if require_rich_context:
-            has_context = bool(r.get("has_photo") or r.get("status_notes") or r.get("resolution_notes"))
+            has_context = bool(
+                r.get("has_photo") or r.get("status_notes") or r.get("resolution_notes")
+            )
             if not has_context:
                 continue
         if only_mine and annotator_uid not in unique_annotators(labels):
@@ -518,12 +618,17 @@ def subset(
 
 def main() -> None:
     supabase_client = get_supabase_client()
-    if supabase_client is not None:
-        user = authenticate_supabase(supabase_client)
-    else:
-        users = load_users(str(USERS_FILE))
-        user = authenticate(users)
+    if supabase_client is None:
+        st.error(
+            "Supabase configuration missing. Set SUPABASE_URL and SUPABASE_ANON_KEY to run the labeler."
+        )
+        st.stop()
+
+    user = authenticate_supabase(supabase_client)
     if user is None:
+        if st.session_state.get(STATE_TOKEN_TRIES, 0) > 0 and st.session_state.get(STATE_TOKEN_TRIES, 0) <= 1:
+            st.info("Restoring session…")
+            st.stop()
         st.stop()
 
     annotator_uid = str(user.get("id"))
@@ -536,21 +641,16 @@ def main() -> None:
     )
 
     if st.sidebar.button("Log out"):
-        if supabase_client is not None:
-            try:
-                supabase_client.auth.sign_out()
-            except Exception:
-                pass
-            st.session_state.pop("sb_session", None)
-        else:
-            st.session_state.pop("user", None)
+        try:
+            supabase_client.auth.sign_out()
+        except Exception:
+            pass
+        st.session_state.pop("sb_session", None)
+        clear_tokens()
         st.rerun()
 
     rows_all = load_rows(RAW)
-    if supabase_client is not None:
-        labels_by_request = load_labels_supabase(supabase_client)
-    else:
-        labels_by_request = load_all_labels(str(LABELS_DIR))
+    labels_by_request = load_labels_supabase(supabase_client)
 
     status_counts: Dict[str, int] = {}
     for record in rows_all:
@@ -563,7 +663,7 @@ def main() -> None:
     with_resolution_notes = sum(1 for r in rows_all if r.get("resolution_notes"))
 
     if BACKUP_SETTING is None:
-        enable_file_backup = supabase_client is None
+        enable_file_backup = False
     else:
         enable_file_backup = BACKUP_SETTING not in {"0", "false", "False"}
 
@@ -578,8 +678,18 @@ def main() -> None:
         st.write(f"With resolution notes: {with_resolution_notes}")
 
     has_photo = st.sidebar.selectbox("Has photo?", ["any", "with photos", "no photos"])
-    has_photo = None if has_photo == "any" else (True if has_photo == "with photos" else False)
-    kw_opts = ["passed_out", "blocking", "onramp", "propane", "fire", "children", "wheelchair"]
+    has_photo = (
+        None if has_photo == "any" else (True if has_photo == "with photos" else False)
+    )
+    kw_opts = [
+        "passed_out",
+        "blocking",
+        "onramp",
+        "propane",
+        "fire",
+        "children",
+        "wheelchair",
+    ]
     kw_filters = st.sidebar.multiselect("Must include keywords", kw_opts, default=[])
     tag_opts = ["lying_face_down", "tents_present"]
     tag_filters = st.sidebar.multiselect("Must include tags", tag_opts, default=[])
@@ -645,7 +755,10 @@ def main() -> None:
     elif sort_mode == "Oldest first":
         rows.sort(key=lambda r: parse_created_at(r.get("created_at")) or datetime.max)
     elif sort_mode == "Newest first":
-        rows.sort(key=lambda r: parse_created_at(r.get("created_at")) or datetime.min, reverse=True)
+        rows.sort(
+            key=lambda r: parse_created_at(r.get("created_at")) or datetime.min,
+            reverse=True,
+        )
     elif sort_mode == "Request ID":
         rows.sort(key=lambda r: str(r.get("request_id") or ""))
 
@@ -664,17 +777,24 @@ def main() -> None:
     existing_labels = sort_labels(labels_by_request.get(req_id, []))
     current_status = request_status(existing_labels)
 
-    queue_col, progress_col, idx_col, elapsed_col = st.columns([2, 2, 1, 1])
-    queue_col.metric("Queue size", len(rows))
-    progress_col.metric("Unique labeled", len([r for r in labels_by_request if labels_by_request[r]]))
-    idx_col.metric("Index", f"{idx + 1}/{len(rows)}")
-    elapsed_col.metric(
-        "Resolution time",
-        format_duration_hours(record.get("hours_to_resolution")),
-    )
-    st.caption(
-        f"Signed in as {annotator_display} ({annotator_role}) — Request status: {current_status}"
-    )
+    with st.container():
+        queue_col, progress_col, idx_col, elapsed_col = st.columns([2, 2, 1, 1])
+        queue_col.metric("Queue size", len(rows))
+        progress_col.metric(
+            "Unique labeled",
+            len([r for r in labels_by_request if labels_by_request[r]]),
+        )
+        idx_col.metric("Index", f"{idx + 1}/{len(rows)}")
+        elapsed_col.metric(
+            "Time to resolution",
+            format_duration_hours(record.get("hours_to_resolution")),
+        )
+        st.caption(
+            f"Signed in as {annotator_display} ({annotator_role}) — Request status: {current_status}"
+        )
+        st.markdown(
+            f"**Case snapshot:** {status_badge(record)} · {outcome_highlight(record)}"
+        )
 
     images = resolve_images(record)
 
@@ -705,7 +825,7 @@ def main() -> None:
                 st.info(f"Showing first 9 images ({len(images)} total)")
 
     with right:
-        st.markdown("#### Label entry")
+        st.markdown("#### Decision")
         glossary_pairs = list(FIELD_GLOSSARY.items())
         if hasattr(st, "popover"):
             with st.popover("ℹ️ Field glossary"):
@@ -820,7 +940,9 @@ def main() -> None:
 
         confidence_opts = ["High", "Medium", "Low"]
         confidence_default = (
-            prefill.get("confidence") if prefill and prefill.get("confidence") in confidence_opts else "Medium"
+            prefill.get("confidence")
+            if prefill and prefill.get("confidence") in confidence_opts
+            else "Medium"
         )
         confidence = st.selectbox(
             "Confidence",
@@ -838,14 +960,16 @@ def main() -> None:
             "Map/location",
             "Other external context",
         ]
-        prefill_sources = (
-            prefill.get("evidence_sources") if prefill else []
-        )
+        prefill_sources = prefill.get("evidence_sources") if prefill else []
         valid_sources = [s for s in prefill_sources or [] if s in info_source_options]
         info_sources = st.multiselect(
             "Information used",
             info_source_options,
-            default=valid_sources or ["Photos"] if record.get("has_photo") else valid_sources,
+            default=(
+                valid_sources or ["Photos"]
+                if record.get("has_photo")
+                else valid_sources
+            ),
             help=LABEL_TIPS["evidence_sources"],
         )
 
@@ -873,33 +997,41 @@ def main() -> None:
             help=LABEL_TIPS["notes"],
         )
 
+        st.markdown("#### Status & Notes")
+        st.markdown(f"**Case status:** {status_badge(record)}")
+        st.markdown(f"**Created:** {format_timestamp(record.get('created_at'))}")
+        st.markdown(f"**Last updated:** {format_timestamp(record.get('updated_at'))}")
+        st.markdown(f"**Closure notes:** {record.get('status_notes') or '—'}")
+        st.markdown(f"**Post-closure notes:** {record.get('resolution_notes') or '—'}")
+        if record.get("after_action_url"):
+            st.markdown(f"**After action link:** {record.get('after_action_url')}")
+
         st.divider()
         st.markdown("#### Context & History")
-        keywords = [k.replace('kw_', '') for k in record.keys() if k.startswith('kw_') and record[k]]
-        summary_tab, history_tab, raw_tab = st.tabs(["Summary", "Annotation history", "Raw data"])
+        keywords = [
+            k.replace("kw_", "")
+            for k in record.keys()
+            if k.startswith("kw_") and record[k]
+        ]
+        summary_tab, history_tab, raw_tab = st.tabs(
+            ["Summary", "Annotation history", "Raw data"]
+        )
 
         with summary_tab:
-            status_value = record.get("status") or "—"
-            status_lower = str(record.get("status") or "").lower()
-            closed_states = {"closed", "completed", "resolved"}
-            status_state = "Closed" if status_lower in closed_states else "Open"
             summary_rows = [
                 ("Created", format_timestamp(record.get("created_at"))),
                 ("Updated", format_timestamp(record.get("updated_at"))),
-                ("Status", f"{status_value} ({status_state})" if status_value != "—" else status_value),
-                ("Resolution time", format_duration_hours(record.get("hours_to_resolution"))),
                 ("District", record.get("police_district") or "—"),
                 (
                     "Neighborhood",
                     record.get("neighborhoods_sffind_boundaries") or "—",
                 ),
                 ("Service subtype", record.get("service_subtype") or "—"),
-                ("Status notes", record.get("status_notes") or "—"),
-                ("Resolution notes", record.get("resolution_notes") or "—"),
-                ("After action", record.get("after_action_url") or "—"),
-                ("Location", f"{record.get('lat')}, {record.get('lon')}")
-                if record.get("lat") and record.get("lon")
-                else ("Location", "—"),
+                (
+                    ("Location", f"{record.get('lat')}, {record.get('lon')}")
+                    if record.get("lat") and record.get("lon")
+                    else ("Location", "—")
+                ),
                 ("Keywords", ", ".join(keywords) or "—"),
             ]
             summary_df = pd.DataFrame(summary_rows, columns=["Attribute", "Value"])
@@ -932,7 +1064,11 @@ def main() -> None:
                             "confidence": entry.get("confidence") or "",
                             "evidence": ", ".join(entry.get("evidence_sources") or []),
                             "status": entry.get("status")
-                            or ("needs_review" if entry.get("needs_review") else "pending"),
+                            or (
+                                "needs_review"
+                                if entry.get("needs_review")
+                                else "pending"
+                            ),
                             "notes": entry.get("notes") or "",
                         }
                         for entry in existing_labels
@@ -1005,8 +1141,6 @@ def main() -> None:
                 "revision_of": prefill.get("label_id") if prefill else None,
             }
             save_label(payload, supabase_client, enable_file_backup)
-            if supabase_client is None and enable_file_backup:
-                load_all_labels.clear()
             st.session_state.idx = min(idx + 1, len(rows) - 1)
             st.rerun()
 

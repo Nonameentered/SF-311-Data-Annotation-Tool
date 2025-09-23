@@ -20,6 +20,9 @@ data/images/
 data/labels/
 data/audit/
 data/eval/
+
+# Secrets
 .env
 .streamlit/secrets.toml
 config/annotators.json
+supabase/.temp/

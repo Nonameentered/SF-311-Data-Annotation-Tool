@@ -20,22 +20,22 @@ Outputs:
 - `data/transformed.jsonl` (+ `.parquet`, `.csv`)
 - `data/eval_report.json`
 - Audit snapshots → `data/audit/`
-- Streamlit label events → Supabase `labels` table (or `data/labels/` in local fallback)
+- Streamlit label events → Supabase `labels` table (optional JSONL mirror when enabled)
 
 ## Environment Configuration
 
-Copy `.env.example` → `.env` (or fill `.streamlit/secrets.toml`) and provide:
+Copy `.streamlit/secrets.example.toml` → `.streamlit/secrets.toml` and provide:
 
 ```
 SUPABASE_URL=https://<project>.supabase.co
-SUPABASE_ANON_KEY=<anon-or-service-role-key>
-LABELS_JSONL_BACKUP=0
-LABELER_DATA_DIR=/app/data
-LABELS_OUTPUT_DIR=/app/data/labels
+SUPABASE_ANON_KEY=<publishable-or-anon-key>
+LABELS_JSONL_BACKUP=0  # set to 1 only if you want local JSONL mirroring
+LABELER_DATA_DIR=data          # override only if your environment uses a different path
+LABELS_OUTPUT_DIR=data/labels
 MAX_ANNOTATORS_PER_REQUEST=3
 ```
 
-With Supabase configured, the Streamlit app offers self-service signup/login and writes labels directly to the `labels` table defined in `supabase/labels_table.sql`.
+With Supabase configured, the Streamlit app offers self-service signup/login and writes labels directly to the tables provisioned by the SQL migrations under `supabase/migrations/` (run `supabase db push` after cloning).
 
 ## CI / Data Refresh
 
