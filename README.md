@@ -28,7 +28,8 @@ Copy `.streamlit/secrets.example.toml` → `.streamlit/secrets.toml` and provide
 
 ```
 SUPABASE_URL=https://<project>.supabase.co
-SUPABASE_ANON_KEY=<publishable-or-anon-key>
+SUPABASE_PUBLISHABLE_KEY=<publishable-or-anon-key>
+# If still on legacy keys, provide SUPABASE_ANON_KEY instead.
 LABELS_JSONL_BACKUP=0  # set to 1 only if you want local JSONL mirroring
 LABELER_DATA_DIR=data          # override only if your environment uses a different path
 LABELS_OUTPUT_DIR=data/labels

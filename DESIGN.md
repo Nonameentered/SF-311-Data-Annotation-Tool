@@ -21,8 +21,8 @@ Stand up an image-first labeling workflow for SF311 homelessness reports so we c
    - `make eval` runs rule-based checks (keyword agreement, numeric bounds) producing `data/eval_report.json`.
    - Add pytest coverage for schema + checksum expectations (e.g., `tests/test_transform.py`).
 4. **Label Collection (Streamlit)**
-   - `make labeler` launches `scripts/labeler_app.py`.
-   - Supabase email/password (self-serve sign-up, email verification) is required. Provide `SUPABASE_URL` + `SUPABASE_ANON_KEY`/`SUPABASE_SERVICE_ROLE_KEY` via env vars before launching.
+   - `make labeler` launches `streamlit_app.py` (which wraps `scripts/labeler_app`).
+   - Supabase email/password (self-serve sign-up, email verification) is required. Provide `SUPABASE_URL` plus a `SUPABASE_PUBLISHABLE_KEY`/`SUPABASE_ANON_KEY` via env vars or secrets before launching.
    - Enforces a cap of three distinct annotators per request; individuals can load/revise their prior submission, flag items for review, and set label status (`pending`/`resolved`).
    - Saves events into a Supabase `labels` table (JSON payload) and optionally mirrors to per-day JSONL backups (`data/labels/{date}/labels.jsonl`). Set `LABELS_JSONL_BACKUP=1` to enable the mirror when desired.
    - Bounding boxes are postponed; design keeps room to plug `streamlit-drawable-canvas` later.
@@ -85,9 +85,9 @@ Supabase table (`labels`) should mirror the schema above (JSONB column for `feat
 
 ## Deployment Playbook
 1. **Supabase setup**: create a project, enable email auth with self-service sign-up, and create a `labels` table with columns matching the schema (use JSONB for `features`, arrays for `image_paths`/`image_checksums`). Configure RLS to allow authenticated users to insert/update their own rows and reviewers to read all data.
-2. **Secrets**: provide `SUPABASE_URL` + `SUPABASE_ANON_KEY` (or service key) and optional `LABELER_DATA_DIR`, `LABELS_OUTPUT_DIR`, `LABELS_JSONL_BACKUP` via environment variables or Streamlit secrets.
+2. **Secrets**: provide `SUPABASE_URL` + `SUPABASE_PUBLISHABLE_KEY` (or, if unavailable, an anon key) and optional `LABELER_DATA_DIR`, `LABELS_OUTPUT_DIR`, `LABELS_JSONL_BACKUP` via environment variables or Streamlit secrets.
 3. **Build & deploy**: containerize or use Streamlit Community Cloud. During build run `uv sync`, `make transform`, `make fetch-images`, and mount persistent storage (S3/GCS or volume) for image cache + JSONL backups.
-4. **Runtime**: launch the Streamlit app with `streamlit run scripts/labeler_app.py --server.port $PORT --server.address 0.0.0.0`. Ensure the container can reach Supabase and image storage.
+4. **Runtime**: launch the Streamlit app with `streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0`. Ensure the container can reach Supabase and image storage.
 5. **Ops**: schedule `make transform`, `make fetch-images`, and `make audit --snapshot-out ...` (cron, GitHub Actions, or Cloud Scheduler) to refresh data and drop snapshots in storage. Use Supabase SQL or notebooks for reconciliation and exporting evaluation splits.
 
 GitHub Actions pipeline (`.github/workflows/data-refresh.yml`) runs the transform → fetch-images → audit sequence on every push to `main` and nightly; configure repository secrets (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, optional storage keys) before enabling it.

@@ -68,7 +68,7 @@ fetch-images: ## Download and cache images referenced in transformed data
 .PHONY: labeler
 labeler: ## Launch Streamlit HITL labeler
 	$(call _header,Streamlit Labeler)
-	$(UV) run streamlit run scripts/labeler_app.py
+	$(UV) run streamlit run streamlit_app.py
 
 .PHONY: lint
 lint: ## Lint with ruff; style-check with black

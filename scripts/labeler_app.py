@@ -42,6 +42,9 @@ APP_TITLE = "SF311 Priority Labeler — Human-in-the-Loop"
 
 
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    env_value = os.getenv(key)
+    if env_value is not None:
+        return env_value
     try:
         secrets_obj = dict(st.secrets)  # type: ignore[arg-type]
     except StreamlitSecretNotFoundError:
@@ -138,9 +141,20 @@ RAW = DATA / "transformed.jsonl"
 LABELS_DIR = Path(get_secret("LABELS_OUTPUT_DIR", str(DATA / "labels")))
 MAX_ANNOTATORS = int(get_secret("MAX_ANNOTATORS_PER_REQUEST", "3"))
 SUPABASE_URL = get_secret("SUPABASE_URL")
-SUPABASE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY") or get_secret(
-    "SUPABASE_ANON_KEY"
+SUPABASE_PUBLISHABLE_KEY = get_secret("SUPABASE_PUBLISHABLE_KEY")
+SUPABASE_ANON_KEY = get_secret("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_KEY = (
+    SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY
 )
+SUPABASE_KEY_KIND = None
+if SUPABASE_KEY:
+    if SUPABASE_KEY == SUPABASE_SERVICE_ROLE_KEY:
+        SUPABASE_KEY_KIND = "service"
+    elif SUPABASE_KEY == SUPABASE_PUBLISHABLE_KEY:
+        SUPABASE_KEY_KIND = "publishable"
+    else:
+        SUPABASE_KEY_KIND = "anon"
 BACKUP_SETTING = get_secret("LABELS_JSONL_BACKUP")
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -319,7 +333,24 @@ def format_duration_hours(value: Any) -> str:
 
 def get_supabase_client() -> Optional[Client]:
     if not SUPABASE_URL or not SUPABASE_KEY or create_client is None:
+        if not SUPABASE_URL:
+            st.error("SUPABASE_URL is not configured. Add it to Streamlit secrets or environment variables.")
+        elif not SUPABASE_KEY:
+            st.error(
+                "Supabase key is missing. Provide SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY in secrets/environment."
+            )
+        elif create_client is None:
+            st.error(
+                "supabase-py is not installed. Run 'uv add supabase' or sync dependencies via 'make init'."
+            )
         return None
+    if SUPABASE_KEY_KIND == "service" and not st.session_state.get(
+        "_service_key_warned", False
+    ):
+        st.warning(
+            "Streamlit is using a Supabase service-role key. Switch to a publishable/anon key for client-side sessions.",
+        )
+        st.session_state["_service_key_warned"] = True
     try:
         client = create_client(SUPABASE_URL, SUPABASE_KEY)
         restore_supabase_session(client)
@@ -684,9 +715,6 @@ def subset(
 def main() -> None:
     supabase_client = get_supabase_client()
     if supabase_client is None:
-        st.error(
-            "Supabase configuration missing. Set SUPABASE_URL and SUPABASE_ANON_KEY to run the labeler."
-        )
         st.stop()
 
     user = authenticate_supabase(supabase_client)

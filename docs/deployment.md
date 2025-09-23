@@ -11,7 +11,8 @@ Create a `.env` (local) or use Streamlit secrets / deployment secrets with the f
 
 ```
 SUPABASE_URL=https://<project>.supabase.co
-SUPABASE_ANON_KEY=<anon-or-service-role-key>
+SUPABASE_PUBLISHABLE_KEY=<publishable-key>
+# If your project has not migrated yet, set SUPABASE_ANON_KEY instead.
 LABELS_JSONL_BACKUP=0
 LABELER_DATA_DIR=/app/data
 LABELS_OUTPUT_DIR=/app/data/labels
@@ -19,10 +20,11 @@ MAX_ANNOTATORS_PER_REQUEST=3
 ```
 
 For Streamlit Cloud, add the same values to `.streamlit/secrets.toml` or the cloud dashboard. Because `LABELS_JSONL_BACKUP` defaults to `0` when Supabase is configured, production runs will avoid writing local JSONL copies.
+If you temporarily supply a service-role key for local testing, rotate it and remove it from secrets before deploying.
 
 GitHub repository secrets required by CI/CD:
 - `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_ANON_KEY` if you prefer anon key in workflows)
+- `SUPABASE_SERVICE_ROLE_KEY` (only for server-side jobs that require elevated privileges) or `SUPABASE_ANON_KEY` for read/write tests
 - `LABELS_JSONL_BACKUP` set to `0`
 - Any storage credentials needed for image fetches (e.g., `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` if pulling from private S3)
 
@@ -42,7 +44,7 @@ Make sure your repository secrets supply the Supabase keys and any other credent
    uv sync
    make transform
    make fetch-images
-   streamlit run scripts/labeler_app.py --server.port $PORT --server.address 0.0.0.0
+   streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0
    ```
 4. Test the signup flow: create a new account via the Streamlit UI, confirm the email (Supabase sends it), label a request, and verify the row appears in the Supabase `labels` table.
 
