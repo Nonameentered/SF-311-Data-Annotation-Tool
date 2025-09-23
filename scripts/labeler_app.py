@@ -60,14 +60,22 @@ STATE_TOKEN_TRIES = "sb_token_load_tries"
 
 def load_tokens_from_storage() -> Optional[Dict[str, str]]:
     tokens = st.session_state.get(STATE_TOKEN_KEY)
-    if isinstance(tokens, dict) and tokens.get("access_token") and tokens.get("refresh_token"):
+    if (
+        isinstance(tokens, dict)
+        and tokens.get("access_token")
+        and tokens.get("refresh_token")
+    ):
         st.session_state[STATE_TOKEN_TRIES] = 0
         return tokens
     try:
         stored = SESSION_STORAGE.get(SESSION_TOKEN_NAME)
     except Exception:
         stored = None
-    if isinstance(stored, dict) and stored.get("access_token") and stored.get("refresh_token"):
+    if (
+        isinstance(stored, dict)
+        and stored.get("access_token")
+        and stored.get("refresh_token")
+    ):
         st.session_state[STATE_TOKEN_KEY] = stored
         st.session_state[STATE_TOKEN_TRIES] = 0
         return stored
@@ -94,13 +102,19 @@ def clear_tokens() -> None:
         pass
 
 
-def restore_supabase_session(client: Client) -> None:  # pragma: no cover - requires Supabase
+def restore_supabase_session(
+    client: Client,
+) -> None:  # pragma: no cover - requires Supabase
     tokens = load_tokens_from_storage()
     if not tokens:
         return
     try:
-        session_result = client.auth.set_session(tokens["access_token"], tokens["refresh_token"])
-        current = session_result.session if session_result else client.auth.get_session()
+        session_result = client.auth.set_session(
+            tokens["access_token"], tokens["refresh_token"]
+        )
+        current = (
+            session_result.session if session_result else client.auth.get_session()
+        )
         if current and current.access_token and current.refresh_token:
             save_tokens(current.access_token, current.refresh_token)
         if "sb_session" not in st.session_state:
@@ -124,7 +138,9 @@ RAW = DATA / "transformed.jsonl"
 LABELS_DIR = Path(get_secret("LABELS_OUTPUT_DIR", str(DATA / "labels")))
 MAX_ANNOTATORS = int(get_secret("MAX_ANNOTATORS_PER_REQUEST", "3"))
 SUPABASE_URL = get_secret("SUPABASE_URL")
-SUPABASE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY") or get_secret("SUPABASE_ANON_KEY")
+SUPABASE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY") or get_secret(
+    "SUPABASE_ANON_KEY"
+)
 BACKUP_SETTING = get_secret("LABELS_JSONL_BACKUP")
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -515,8 +531,15 @@ def authenticate_supabase(
                             "Sign in failed. Check credentials or verify your email."
                         )
                     else:
-                        if result.session and result.session.access_token and result.session.refresh_token:
-                            save_tokens(result.session.access_token, result.session.refresh_token)
+                        if (
+                            result.session
+                            and result.session.access_token
+                            and result.session.refresh_token
+                        ):
+                            save_tokens(
+                                result.session.access_token,
+                                result.session.refresh_token,
+                            )
                         profile = {
                             "id": user.id,
                             "email": user.email,
@@ -567,7 +590,11 @@ def authenticate_supabase(
                         )
                         st.rerun()
                     else:
-                        if result.session and result.session.access_token and result.session.refresh_token:
+                        if (
+                            result.session
+                            and result.session.access_token
+                            and result.session.refresh_token
+                        ):
                             save_tokens(
                                 result.session.access_token,
                                 result.session.refresh_token,
@@ -664,7 +691,10 @@ def main() -> None:
 
     user = authenticate_supabase(supabase_client)
     if user is None:
-        if st.session_state.get(STATE_TOKEN_TRIES, 0) > 0 and st.session_state.get(STATE_TOKEN_TRIES, 0) <= 1:
+        if (
+            st.session_state.get(STATE_TOKEN_TRIES, 0) > 0
+            and st.session_state.get(STATE_TOKEN_TRIES, 0) <= 1
+        ):
             st.info("Restoring session…")
             st.stop()
         st.stop()
@@ -677,6 +707,13 @@ def main() -> None:
         or user.get("email")
         or annotator_uid
     )
+
+    NOTE_STATE_KEY = "note_text"
+    NOTE_REQ_KEY = "note_text_request_id"
+
+    def reset_note_state() -> None:
+        st.session_state.pop(NOTE_STATE_KEY, None)
+        st.session_state.pop(NOTE_REQ_KEY, None)
 
     if st.sidebar.button("Log out"):
         try:
@@ -866,9 +903,30 @@ def main() -> None:
     with left:
         st.subheader(f"Request {req_id or '—'}")
         st.caption(
-            f"Created: {record.get('created_at') or '—'} | District: {record.get('police_district') or '—'}"
+            " | ".join(
+                [
+                    f"Created: {format_timestamp(record.get('created_at'))}",
+                    f"Updated: {format_timestamp(record.get('updated_at'))}",
+                    f"District: {record.get('police_district') or '—'}",
+                ]
+            )
         )
         st.write(record.get("text") or "(No description)")
+
+        status_notes = record.get("status_notes")
+        resolution_notes = record.get("resolution_notes")
+        after_action_url = record.get("after_action_url")
+        if status_notes or resolution_notes or after_action_url:
+            if status_notes:
+                st.markdown("**Closure notes:**")
+                st.write(status_notes)
+            if resolution_notes:
+                st.markdown("**Post-closure notes:**")
+                st.write(resolution_notes)
+            if after_action_url:
+                st.markdown("**After action link:**")
+                st.markdown(f"[Open after action report]({after_action_url})")
+
         st.markdown("---")
         st.markdown("#### Images")
         if not images:
@@ -908,6 +966,7 @@ def main() -> None:
             width="stretch",
         ):
             st.session_state["prefill"] = latest_for_user
+            reset_note_state()
             st.rerun()
 
         prefill = st.session_state.pop("prefill", latest_for_user)
@@ -937,10 +996,13 @@ def main() -> None:
             help=LABEL_TIPS["priority"],
         )
 
-        notes_val = prefill.get("notes") if prefill else ""
+        notes_val = (prefill.get("notes") if prefill else "") or ""
+        if st.session_state.get(NOTE_REQ_KEY) != req_id:
+            st.session_state[NOTE_REQ_KEY] = req_id
+            st.session_state[NOTE_STATE_KEY] = str(notes_val)
         notes = st.text_area(
             "Notes",
-            value=notes_val or "",
+            key=NOTE_STATE_KEY,
             height=110,
             help=LABEL_TIPS["notes"],
         )
@@ -1062,15 +1124,6 @@ def main() -> None:
             help=LABEL_TIPS["label_status"],
         )
 
-        st.markdown("#### Status & Notes")
-        st.markdown(f"**Case status:** {status_badge(record)}")
-        st.markdown(f"**Created:** {format_timestamp(record.get('created_at'))}")
-        st.markdown(f"**Last updated:** {format_timestamp(record.get('updated_at'))}")
-        st.markdown(f"**Closure notes:** {record.get('status_notes') or '—'}")
-        st.markdown(f"**Post-closure notes:** {record.get('resolution_notes') or '—'}")
-        if record.get("after_action_url"):
-            st.markdown(f"**After action link:** {record.get('after_action_url')}")
-
         st.divider()
         st.markdown("#### Context & History")
         keywords = [
@@ -1183,6 +1236,7 @@ def main() -> None:
 
     if prev_clicked:
         st.session_state.idx = max(idx - 1, 0)
+        reset_note_state()
         st.rerun()
     elif save_clicked:
         label_id = str(uuid.uuid4())
@@ -1220,9 +1274,11 @@ def main() -> None:
         }
         save_label(payload, supabase_client, enable_file_backup)
         st.session_state.idx = min(idx + 1, len(rows) - 1)
+        reset_note_state()
         st.rerun()
     elif skip_clicked:
         st.session_state.idx = min(idx + 1, len(rows) - 1)
+        reset_note_state()
         st.rerun()
 
 
