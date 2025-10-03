@@ -7,7 +7,7 @@ This roadmap focuses on delivering a production-ready Supabase + Streamlit label
 1. **Environments**: keep only Local (developer machines) and Production. Use ad-hoc preview builds when necessary instead of maintaining a staging stack.
 2. **Configuration**: store Supabase secrets in `.streamlit/secrets.toml` locally (copied from the example) and via the hosting platform’s secret manager in production. Supabase remains the single source for auth + data; JSONL backups are optional.
 3. **Milestone 1**: implement the UI restructure (snapshot ribbon, decision/status cards, outcome sentence).
-4. **Milestone 2**: add the “My Labels” view, undo action, and outcome-alignment fields once the new layout is approved.
+4. **Milestone 2** *(Sept 23, 2025 – implemented)*: adds the “My Labels” view, undo action, and outcome-alignment fields once the new layout is approved.
 5. **Milestone 3**: refine queue prioritization and clean up redundant UI elements.
 
 ## 1. UI Restructure Roadmap
@@ -25,10 +25,8 @@ This roadmap focuses on delivering a production-ready Supabase + Streamlit label
 ## 2. Field Naming & Data Model Adjustments
 
 - Update UI labels: display “Closure notes” (status_notes), “Post-closure notes” (resolution_notes), and “Time to resolution”. Ensure tooltips in `FIELD_GLOSSARY` stay in sync.
-- Add new annotation fields after the layout lands:
-  - `outcome_alignment`: single-select (`service_delivered`, `client_declined`, `unable_to_locate`, `other`).
-  - `follow_up_need`: multi-select (`mental_health`, `shelter`, `case_management`, `medical`, `sanitation`, `legal`, `other`).
-- Plan schema updates in `supabase/migrations/` and extend payload handling + tests when implementing Milestone 2.
+- **Status**: `outcome_alignment` (single-select) and `follow_up_need` (multi-select) are live, with Supabase columns provisioned in `20250923002000_labels_add_outcome_fields.sql`.
+- Friendly feature labels now surface responder language (e.g., “Person lying face down”, “Mobility device mentioned”).
 - Keep existing keyword flags for now; revisit once downstream usage is audited.
 
 ## 3. Queue Logic Enhancements
@@ -45,8 +43,8 @@ This roadmap focuses on delivering a production-ready Supabase + Streamlit label
 
 ## 5. Review & Undo Experience
 
-- **My Labels view**: add a modal/table (supabase query by `annotator_uid`) listing recent labels with “Edit” or “Duplicate” actions.
-- **Undo last action**: after saving, present a toast with “Undo” that restores the previous payload and resubmits it.
+- **Status**: “My recent labels” sidebar expander lists the latest submissions and jumps directly into a request with your last payload.
+- **Status**: “Undo last save” deletes the most recent row (per-annotator delete policy) and restores the prior form state.
 - **Future review mode**: keep a note to add a reviewer-focused queue later; no immediate work required but avoid design conflicts.
 
 ## 6. Testing Checklist

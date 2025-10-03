@@ -22,6 +22,12 @@ Outputs:
 - Audit snapshots → `data/audit/`
 - Streamlit label events → Supabase `labels` table (optional JSONL mirror when enabled)
 
+### Labeler UI Highlights
+- Friendly feature controls (e.g., “Person lying face down”, “Mobility device mentioned”) with tooltips that mirror responder language.
+- New outcome tracking fields: single-select **Outcome alignment** and multi-select **Follow-up needs** (`mental_health`, `shelter`, `case_management`, `medical`, `sanitation`, `legal`, `other`).
+- **My recent labels** sidebar expander shows your last submissions with one-click “Load” to jump back into a request.
+- **Undo last save** button appears after each submission—available for quick corrections until you move on.
+
 ## Environment Configuration
 
 Copy `.streamlit/secrets.example.toml` → `.streamlit/secrets.toml` and provide:

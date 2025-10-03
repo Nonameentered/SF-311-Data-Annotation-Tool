@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 ISO_FORMATS = (
@@ -13,15 +13,23 @@ ISO_FORMATS = (
 def parse_iso(ts: Optional[str]) -> Optional[datetime]:
     if not ts:
         return None
+    parsed: Optional[datetime] = None
     for fmt in ISO_FORMATS:
         try:
-            return datetime.strptime(ts, fmt)
+            parsed = datetime.strptime(ts, fmt)
+            break
         except ValueError:
             continue
-    try:
-        return datetime.fromisoformat(ts)
-    except Exception:  # noqa: BLE001
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(ts)
+        except Exception:  # noqa: BLE001
+            parsed = None
+    if parsed is None:
         return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
 
 
 def sort_labels(labels: List[Dict]) -> List[Dict]:
@@ -50,7 +58,9 @@ def unique_annotators(labels: List[Dict]) -> List[str]:
 def request_status(labels: List[Dict]) -> str:
     if not labels:
         return "unlabeled"
-    if any(bool(l.get("needs_review")) or l.get("status") == "needs_review" for l in labels):
+    if any(
+        bool(l.get("needs_review")) or l.get("status") == "needs_review" for l in labels
+    ):
         return "needs_review"
     priorities = {l.get("priority") for l in labels if l.get("priority")}
     if len(priorities) > 1:
@@ -66,7 +76,9 @@ def latest_label_for_annotator(labels: List[Dict], annotator: str) -> Optional[D
     return sort_labels(matching)[-1]
 
 
-def can_annotator_label(labels: List[Dict], annotator: str, max_annotators: int = 3) -> bool:
+def can_annotator_label(
+    labels: List[Dict], annotator: str, max_annotators: int = 3
+) -> bool:
     annotator = str(annotator)
     annotators = unique_annotators(labels)
     if annotator in annotators:

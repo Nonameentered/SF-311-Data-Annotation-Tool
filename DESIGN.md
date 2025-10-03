@@ -24,6 +24,7 @@ Stand up an image-first labeling workflow for SF311 homelessness reports so we c
    - `make labeler` launches `streamlit_app.py` (which wraps `scripts/labeler_app`).
    - Supabase email/password (self-serve sign-up, email verification) is required. Provide `SUPABASE_URL` plus a `SUPABASE_PUBLISHABLE_KEY`/`SUPABASE_ANON_KEY` via env vars or secrets before launching.
    - Enforces a cap of three distinct annotators per request; individuals can load/revise their prior submission, flag items for review, and set label status (`pending`/`resolved`).
+   - Adds outcome tracking (`outcome_alignment`, `follow_up_need`), a “My recent labels” sidebar expander for quick jumps, and an undo button that deletes the most recent label if pressed immediately.
    - Saves events into a Supabase `labels` table (JSON payload) and optionally mirrors to per-day JSONL backups (`data/labels/{date}/labels.jsonl`). Set `LABELS_JSONL_BACKUP=1` to enable the mirror when desired.
    - Bounding boxes are postponed; design keeps room to plug `streamlit-drawable-canvas` later.
 5. **Gold Set Assembly**

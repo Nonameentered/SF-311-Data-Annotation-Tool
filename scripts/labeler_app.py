@@ -5,9 +5,10 @@ import os
 import random
 import sys
 import uuid
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 import streamlit as st
@@ -191,6 +192,20 @@ FEATURE_TIPS: Dict[str, str] = {
     "size_feet_bin": "Linear footprint in feet from HSOC responders. Use bins to adjust if photos show otherwise.",
 }
 
+FEATURE_DISPLAY_NAMES: Dict[str, str] = {
+    "lying_face_down": "Person lying face down",
+    "safety_issue": "Immediate safety issue",
+    "drugs": "Drug use or paraphernalia",
+    "tents_present": "Tents or structures present",
+    "blocking": "Blocking right-of-way",
+    "on_ramp": "Near freeway on/off ramp",
+    "propane_or_flame": "Propane, open flame, or generator",
+    "children_present": "Children present",
+    "wheelchair": "Mobility device mentioned",
+    "num_people_bin": "Estimated number of people",
+    "size_feet_bin": "Footprint (linear feet)",
+}
+
 LABEL_TIPS: Dict[str, str] = {
     "priority": "P1 = life-threatening/immediate, P4 = informational only. Priorities should track urgency and resource need.",
     "confidence": "How certain you are about the assigned priority/features based on available evidence.",
@@ -199,14 +214,83 @@ LABEL_TIPS: Dict[str, str] = {
     "abstain": "Use when context is insufficient to label confidently.",
     "needs_review": "Flag items that require supervisor follow-up or contain conflicting info.",
     "label_status": "Mark `resolved` once the case has been adjudicated or synced into the gold set.",
+    "outcome_alignment": "How the observed outcome aligns with expectations or service goals.",
+    "follow_up_need": "Additional services that would help this case (multi-select).",
 }
+
+OUTCOME_OPTIONS: List[Tuple[str, str]] = [
+    ("", "Select outcome alignment"),
+    ("service_delivered", "Service delivered / resolved"),
+    ("client_declined", "Client declined or not interested"),
+    ("unable_to_locate", "Unable to locate client"),
+    ("other", "Other outcome"),
+]
+
+FOLLOW_UP_OPTIONS: List[Tuple[str, str]] = [
+    ("mental_health", "Mental health support"),
+    ("shelter", "Shelter / placement"),
+    ("case_management", "Case management"),
+    ("medical", "Medical support"),
+    ("sanitation", "Sanitation / cleanup"),
+    ("legal", "Legal or documentation"),
+    ("other", "Other resource"),
+]
+
+KEYWORD_FILTER_OPTIONS: List[Tuple[str, str]] = [
+    ("passed_out", "Passed out / unresponsive"),
+    ("blocking", "Blocking pathway"),
+    ("onramp", "Freeway on/off ramp"),
+    ("propane", "Propane present"),
+    ("fire", "Active flames"),
+    ("children", "Children mentioned"),
+    ("wheelchair", "Mobility device noted"),
+]
+
+TAG_FILTER_OPTIONS: List[Tuple[str, str]] = [
+    ("lying_face_down", FEATURE_DISPLAY_NAMES["lying_face_down"]),
+    ("tents_present", FEATURE_DISPLAY_NAMES["tents_present"]),
+]
+
+STATUS_FILTER_OPTIONS: List[str] = [
+    "unlabeled",
+    "needs_review",
+    "conflict",
+    "labeled",
+    "all",
+]
+
+
+def outcome_display(value: Optional[str]) -> str:
+    if not value:
+        return "—"
+    for key, label in OUTCOME_OPTIONS:
+        if key == value:
+            return label
+    return value.replace("_", " ").title()
+
+
+def follow_up_display(values: Optional[Sequence[str]]) -> str:
+    if not values:
+        return "—"
+    labels: List[str] = []
+    for item in values:
+        for key, label in FOLLOW_UP_OPTIONS:
+            if key == item:
+                labels.append(label)
+                break
+        else:
+            labels.append(str(item))
+    return ", ".join(labels)
+
 
 FIELD_GLOSSARY: Dict[str, str] = {
     "Priority": LABEL_TIPS["priority"],
-    "size_feet": "`size_feet` is HSOC's estimate of the encampment or belongings footprint in feet. It reflects linear spread, not square footage.",
-    "hours_to_resolution": "Time between the initial request and the last known update/closure.",
-    "status_notes": "311 or responder notes at closure. Often describe remediation or why the case was closed.",
-    "resolution_notes": "Post-closure follow-up notes when provided by HSOC.",
+    "Outcome alignment": LABEL_TIPS["outcome_alignment"],
+    "Follow-up needs": LABEL_TIPS["follow_up_need"],
+    "Footprint (ft)": "`size_feet` captures the linear spread estimated by responders.",
+    "Hours to resolution": "Time between the initial request and the last known update/closure.",
+    "Closure notes": "311 or responder notes at closure. Often describe remediation or why the case was closed.",
+    "Post-closure notes": "Follow-up notes shared after closure (if available).",
 }
 
 
@@ -334,7 +418,9 @@ def format_duration_hours(value: Any) -> str:
 def get_supabase_client() -> Optional[Client]:
     if not SUPABASE_URL or not SUPABASE_KEY or create_client is None:
         if not SUPABASE_URL:
-            st.error("SUPABASE_URL is not configured. Add it to Streamlit secrets or environment variables.")
+            st.error(
+                "SUPABASE_URL is not configured. Add it to Streamlit secrets or environment variables."
+            )
         elif not SUPABASE_KEY:
             st.error(
                 "Supabase key is missing. Provide SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY in secrets/environment."
@@ -377,6 +463,19 @@ def load_labels_supabase(
         ts = row.get("timestamp")
         if isinstance(ts, datetime):
             row["timestamp"] = ts.isoformat()
+        follow_raw = row.get("follow_up_need")
+        if isinstance(follow_raw, str):
+            try:
+                parsed_follow = json.loads(follow_raw)
+                row["follow_up_need"] = (
+                    parsed_follow if isinstance(parsed_follow, list) else []
+                )
+            except json.JSONDecodeError:
+                row["follow_up_need"] = [follow_raw]
+        elif isinstance(follow_raw, list):
+            row["follow_up_need"] = follow_raw
+        else:
+            row["follow_up_need"] = []
         out.setdefault(str(rid), []).append(row)
     return out
 
@@ -390,17 +489,27 @@ def todays_label_file() -> Path:
 
 def save_label(
     payload: Dict[str, Any], supabase_client: Client, enable_file_backup: bool
-) -> None:
+) -> bool:
     try:  # pragma: no cover - requires Supabase
         supabase_client.table("labels").insert(payload).execute()
     except Exception as exc:
         st.error(f"Failed to write label to Supabase: {exc}")
-        return
+        return False
     if enable_file_backup:
         target = todays_label_file()
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    return True
+
+
+def delete_label(label_id: str, supabase_client: Client) -> bool:
+    try:  # pragma: no cover - requires Supabase
+        supabase_client.table("labels").delete().eq("label_id", label_id).execute()
+        return True
+    except Exception as exc:
+        st.error(f"Failed to undo label: {exc}")
+        return False
 
 
 def resolve_images(row: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -743,6 +852,36 @@ def main() -> None:
         st.session_state.pop(NOTE_STATE_KEY, None)
         st.session_state.pop(NOTE_REQ_KEY, None)
 
+    undo_context = st.session_state.get("undo_context")
+    if undo_context:
+        undo_container = st.container()
+        with undo_container:
+            st.success(f"Saved request {undo_context['request_id']}.", icon="✅")
+            if st.button(
+                "Undo last save",
+                key="undo_last_save",
+                help="Removes the most recent label you saved and returns you to that request.",
+            ):
+                label_id_to_delete = undo_context.get("label_id")
+                if label_id_to_delete and delete_label(
+                    label_id_to_delete, supabase_client
+                ):
+                    st.session_state.idx = undo_context.get("previous_idx", 0)
+                    previous_prefill = undo_context.get("previous_prefill")
+                    if previous_prefill:
+                        st.session_state["prefill"] = previous_prefill
+                    request_ref = undo_context.get("request_id", "")
+                    st.session_state["queue_search"] = str(request_ref)
+                    st.session_state.pop("undo_context", None)
+                    st.rerun()
+            if st.button(
+                "Dismiss",
+                key="dismiss_save_notice",
+                help="Hide this message without undoing the label.",
+            ):
+                st.session_state.pop("undo_context", None)
+                st.rerun()
+
     if st.sidebar.button("Log out"):
         try:
             supabase_client.auth.sign_out()
@@ -754,6 +893,33 @@ def main() -> None:
 
     rows_all = load_rows(RAW)
     labels_by_request = load_labels_supabase(supabase_client)
+
+    my_labels: List[Dict[str, Any]] = []
+    for rid, entries in labels_by_request.items():
+        for entry in entries:
+            annot_id = (
+                entry.get("annotator_uid")
+                or entry.get("annotator")
+                or entry.get("annotator_email")
+            )
+            if str(annot_id) != annotator_uid:
+                continue
+            my_labels.append(
+                {
+                    "request_id": str(rid),
+                    "timestamp": entry.get("timestamp"),
+                    "priority": entry.get("priority"),
+                    "status": entry.get("status")
+                    or ("needs_review" if entry.get("needs_review") else "pending"),
+                    "outcome_alignment": entry.get("outcome_alignment"),
+                    "follow_up_need": entry.get("follow_up_need"),
+                    "raw": entry,
+                }
+            )
+
+    my_labels.sort(
+        key=lambda item: parse_iso(item.get("timestamp")) or datetime.min, reverse=True
+    )
 
     status_counts: Dict[str, int] = {}
     for record in rows_all:
@@ -780,34 +946,84 @@ def main() -> None:
         st.write(f"With status notes: {with_notes}")
         st.write(f"With resolution notes: {with_resolution_notes}")
 
+    with st.sidebar.expander("My recent labels", expanded=False):
+        if my_labels:
+            preview_rows = []
+            option_map: Dict[str, Dict[str, Any]] = {}
+            for entry in my_labels[:20]:
+                formatted_time = format_timestamp(entry.get("timestamp"))
+                preview_rows.append(
+                    {
+                        "Request": entry["request_id"],
+                        "Priority": entry.get("priority") or "—",
+                        "Outcome": outcome_display(entry.get("outcome_alignment")),
+                        "Follow-up": follow_up_display(entry.get("follow_up_need")),
+                        "Saved": formatted_time,
+                    }
+                )
+                label_text = f"{entry['request_id']} · {entry.get('priority') or '—'} · {formatted_time}"
+                option_map[label_text] = entry
+
+            st.dataframe(
+                pd.DataFrame(preview_rows), use_container_width=True, hide_index=True
+            )
+
+            select_choices = ["None"] + list(option_map.keys())
+            selected_option = st.selectbox("Jump to request", select_choices)
+            if selected_option != "None" and st.button(
+                "Load selected request",
+                key="load_my_label",
+                help="Jump to the selected request and preload your last label.",
+            ):
+                entry = option_map[selected_option]
+                label_prefill = entry.get("raw") or {}
+                st.session_state["prefill"] = deepcopy(label_prefill)
+                st.session_state["queue_search"] = str(entry["request_id"])
+                st.session_state["jump_target"] = str(entry["request_id"])
+                st.session_state["status_filter"] = "all"
+                st.session_state.pop("undo_context", None)
+                st.session_state["reset"] = True
+                st.rerun()
+        else:
+            st.caption("No saved labels yet.")
+
     has_photo = st.sidebar.selectbox("Has photo?", ["any", "with photos", "no photos"])
     has_photo = (
         None if has_photo == "any" else (True if has_photo == "with photos" else False)
     )
-    kw_opts = [
-        "passed_out",
-        "blocking",
-        "onramp",
-        "propane",
-        "fire",
-        "children",
-        "wheelchair",
-    ]
-    kw_filters = st.sidebar.multiselect("Must include keywords", kw_opts, default=[])
-    tag_opts = ["lying_face_down", "tents_present"]
-    tag_filters = st.sidebar.multiselect("Must include tags", tag_opts, default=[])
+    kw_labels = [label for _, label in KEYWORD_FILTER_OPTIONS]
+    kw_label_to_key = {label: key for key, label in KEYWORD_FILTER_OPTIONS}
+    kw_selected_labels = st.sidebar.multiselect(
+        "Must include keywords", kw_labels, default=[]
+    )
+    kw_filters = [kw_label_to_key[label] for label in kw_selected_labels]
+
+    tag_labels = [label for _, label in TAG_FILTER_OPTIONS]
+    tag_label_to_key = {label: key for key, label in TAG_FILTER_OPTIONS}
+    tag_selected_labels = st.sidebar.multiselect(
+        "Must include tags", tag_labels, default=[]
+    )
+    tag_filters = [tag_label_to_key[label] for label in tag_selected_labels]
+    status_default = st.session_state.get("status_filter", STATUS_FILTER_OPTIONS[0])
+    if status_default not in STATUS_FILTER_OPTIONS:
+        status_default = STATUS_FILTER_OPTIONS[0]
     status_filter = st.sidebar.selectbox(
         "Request status",
-        ["unlabeled", "needs_review", "conflict", "labeled", "all"],
-        index=0,
+        STATUS_FILTER_OPTIONS,
+        index=STATUS_FILTER_OPTIONS.index(status_default),
     )
+    st.session_state["status_filter"] = status_filter
     search_text = st.sidebar.text_input(
         "Search queue",
         value=st.session_state.get("queue_search", ""),
         placeholder="Request ID or keywords",
     )
     st.session_state["queue_search"] = search_text
-    only_mine = st.sidebar.checkbox("Only requests I've labeled", value=False)
+    only_mine_default = bool(st.session_state.get("only_mine", False))
+    only_mine = st.sidebar.checkbox(
+        "Only requests I've labeled", value=only_mine_default
+    )
+    st.session_state["only_mine"] = only_mine
     require_rich_context = st.sidebar.checkbox(
         "Require photos or notes",
         value=False,
@@ -865,8 +1081,20 @@ def main() -> None:
     elif sort_mode == "Request ID":
         rows.sort(key=lambda r: str(r.get("request_id") or ""))
 
-    if "idx" not in st.session_state or st.session_state.get("reset"):
+    jump_target = st.session_state.pop("jump_target", None)
+    jumped = False
+    if jump_target:
+        jump_target = str(jump_target)
+        for idx_candidate, candidate in enumerate(rows):
+            if str(candidate.get("request_id")) == jump_target:
+                st.session_state.idx = idx_candidate
+                jumped = True
+                break
+
+    if "idx" not in st.session_state or (st.session_state.get("reset") and not jumped):
         st.session_state.idx = 0
+        st.session_state["reset"] = False
+    elif st.session_state.get("reset"):
         st.session_state["reset"] = False
 
     if not rows:
@@ -1002,6 +1230,9 @@ def main() -> None:
         record_defaults = record_feature_defaults(record)
         initial_features = {**record_defaults, **prefill_features}
 
+        def widget_key(name: str) -> str:
+            return f"{req_id}_{name}"
+
         def prefill_bool(key: str) -> bool:
             return bool(initial_features.get(key, False))
 
@@ -1022,6 +1253,7 @@ def main() -> None:
             horizontal=True,
             index=prio_index,
             help=LABEL_TIPS["priority"],
+            key=widget_key("priority"),
         )
 
         notes_val = (prefill.get("notes") if prefill else "") or ""
@@ -1038,66 +1270,77 @@ def main() -> None:
         c1, c2, c3 = st.columns(3)
         with c1:
             lying = st.checkbox(
-                "lying_face_down",
+                FEATURE_DISPLAY_NAMES["lying_face_down"],
                 value=prefill_bool("lying_face_down"),
                 help=FEATURE_TIPS["lying_face_down"],
+                key=widget_key("feature_lying_face_down"),
             )
             safety = st.checkbox(
-                "safety_issue",
+                FEATURE_DISPLAY_NAMES["safety_issue"],
                 value=prefill_bool("safety_issue"),
                 help=FEATURE_TIPS["safety_issue"],
+                key=widget_key("feature_safety_issue"),
             )
             drugs = st.checkbox(
-                "drugs",
+                FEATURE_DISPLAY_NAMES["drugs"],
                 value=prefill_bool("drugs"),
                 help=FEATURE_TIPS["drugs"],
+                key=widget_key("feature_drugs"),
             )
         with c2:
             tents = st.checkbox(
-                "tents_present",
+                FEATURE_DISPLAY_NAMES["tents_present"],
                 value=prefill_bool("tents_present"),
                 help=FEATURE_TIPS["tents_present"],
+                key=widget_key("feature_tents_present"),
             )
             blocking = st.checkbox(
-                "blocking",
+                FEATURE_DISPLAY_NAMES["blocking"],
                 value=prefill_bool("blocking"),
                 help=FEATURE_TIPS["blocking"],
+                key=widget_key("feature_blocking"),
             )
             onramp = st.checkbox(
-                "on_ramp",
+                FEATURE_DISPLAY_NAMES["on_ramp"],
                 value=prefill_bool("on_ramp"),
                 help=FEATURE_TIPS["on_ramp"],
+                key=widget_key("feature_on_ramp"),
             )
         with c3:
             propane = st.checkbox(
-                "propane_or_flame",
+                FEATURE_DISPLAY_NAMES["propane_or_flame"],
                 value=prefill_bool("propane_or_flame"),
                 help=FEATURE_TIPS["propane_or_flame"],
+                key=widget_key("feature_propane_or_flame"),
             )
             kids = st.checkbox(
-                "children_present",
+                FEATURE_DISPLAY_NAMES["children_present"],
                 value=prefill_bool("children_present"),
                 help=FEATURE_TIPS["children_present"],
+                key=widget_key("feature_children_present"),
             )
             chair = st.checkbox(
-                "wheelchair",
+                FEATURE_DISPLAY_NAMES["wheelchair"],
                 value=prefill_bool("wheelchair"),
                 help=FEATURE_TIPS["wheelchair"],
+                key=widget_key("feature_wheelchair"),
             )
 
         num_people_opts = ["0", "1", "2-3", "4-5", "6+"]
         num_people_bin = st.selectbox(
-            "num_people_bin",
+            FEATURE_DISPLAY_NAMES["num_people_bin"],
             num_people_opts,
             index=prefill_select("num_people_bin", "1", num_people_opts),
             help=FEATURE_TIPS["num_people_bin"],
+            key=widget_key("num_people_bin"),
         )
         size_opts = ["0", "1-20", "21-80", "81-150", "150+"]
         size_feet_bin = st.selectbox(
-            "size_feet_bin",
+            FEATURE_DISPLAY_NAMES["size_feet_bin"],
             size_opts,
             index=prefill_select("size_feet_bin", "21-80", size_opts),
             help=FEATURE_TIPS["size_feet_bin"],
+            key=widget_key("size_feet_bin"),
         )
 
         confidence_opts = ["High", "Medium", "Low"]
@@ -1111,6 +1354,7 @@ def main() -> None:
             confidence_opts,
             index=confidence_opts.index(confidence_default),
             help=LABEL_TIPS["confidence"],
+            key=widget_key("confidence"),
         )
 
         info_source_options = [
@@ -1133,23 +1377,72 @@ def main() -> None:
                 else valid_sources
             ),
             help=LABEL_TIPS["evidence_sources"],
+            key=widget_key("info_sources"),
         )
+
+        outcome_values = [opt[0] for opt in OUTCOME_OPTIONS]
+        outcome_labels = [opt[1] for opt in OUTCOME_OPTIONS]
+        prefill_outcome = ""
+        if prefill:
+            raw_outcome = prefill.get("outcome_alignment")
+            if raw_outcome in outcome_values:
+                prefill_outcome = str(raw_outcome)
+        default_outcome_index = outcome_values.index(prefill_outcome)
+        outcome_label = st.selectbox(
+            "Outcome alignment",
+            outcome_labels,
+            index=default_outcome_index,
+            help=LABEL_TIPS["outcome_alignment"],
+            key=widget_key("outcome_alignment"),
+        )
+        outcome_alignment = outcome_values[outcome_labels.index(outcome_label)]
+        if outcome_alignment == "":
+            outcome_alignment = None
+
+        follow_up_values = [opt[0] for opt in FOLLOW_UP_OPTIONS]
+        follow_up_labels = [opt[1] for opt in FOLLOW_UP_OPTIONS]
+        prefill_follow: List[str] = []
+        if prefill:
+            raw_follow = prefill.get("follow_up_need") or []
+            if isinstance(raw_follow, str):
+                raw_follow = [raw_follow]
+            if isinstance(raw_follow, list):
+                prefill_follow = [
+                    str(item) for item in raw_follow if item in follow_up_values
+                ]
+        default_follow_labels = [
+            follow_up_labels[follow_up_values.index(item)] for item in prefill_follow
+        ]
+        follow_up_selected_labels = st.multiselect(
+            "Follow-up needs",
+            follow_up_labels,
+            default=default_follow_labels,
+            help=LABEL_TIPS["follow_up_need"],
+            key=widget_key("follow_up_need"),
+        )
+        follow_up_need = [
+            follow_up_values[follow_up_labels.index(label)]
+            for label in follow_up_selected_labels
+        ]
 
         abstain = st.checkbox(
             "Abstain (not sure)",
             value=bool(prefill.get("abstain")) if prefill else False,
             help=LABEL_TIPS["abstain"],
+            key=widget_key("abstain"),
         )
         needs_review = st.checkbox(
             "Flag for review",
             value=bool(prefill.get("needs_review")) if prefill else False,
             help=LABEL_TIPS["needs_review"],
+            key=widget_key("needs_review"),
         )
         label_status = st.selectbox(
             "Label status",
             ["pending", "resolved"],
             index=0 if not prefill or prefill.get("status") != "resolved" else 1,
             help=LABEL_TIPS["label_status"],
+            key=widget_key("label_status"),
         )
 
         st.divider()
@@ -1164,6 +1457,7 @@ def main() -> None:
         )
 
         with summary_tab:
+            latest_any = existing_labels[-1] if existing_labels else None
             summary_rows = [
                 ("Created", format_timestamp(record.get("created_at"))),
                 ("Updated", format_timestamp(record.get("updated_at"))),
@@ -1180,16 +1474,33 @@ def main() -> None:
                 ),
                 ("Keywords", ", ".join(keywords) or "—"),
             ]
+            if latest_any:
+                summary_rows.insert(
+                    1,
+                    (
+                        "Outcome alignment",
+                        outcome_display(latest_any.get("outcome_alignment")),
+                    ),
+                )
+                summary_rows.insert(
+                    2,
+                    (
+                        "Follow-up needs",
+                        follow_up_display(latest_any.get("follow_up_need")),
+                    ),
+                )
             summary_df = pd.DataFrame(summary_rows, columns=["Attribute", "Value"])
             st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
             auto_flags = {
-                "lying_face_down": record.get("tag_lying_face_down"),
-                "tents_present": record.get("tag_tents_present"),
-                "num_people": record.get("tag_num_people"),
-                "size_feet": record.get("tag_size_feet"),
-                "safety_issue": record.get("tag_safety_issue"),
-                "drugs": record.get("tag_drugs"),
+                FEATURE_DISPLAY_NAMES["lying_face_down"]: record.get(
+                    "tag_lying_face_down"
+                ),
+                FEATURE_DISPLAY_NAMES["tents_present"]: record.get("tag_tents_present"),
+                "Responder count": record.get("tag_num_people"),
+                "Responder footprint (ft)": record.get("tag_size_feet"),
+                FEATURE_DISPLAY_NAMES["safety_issue"]: record.get("tag_safety_issue"),
+                FEATURE_DISPLAY_NAMES["drugs"]: record.get("tag_drugs"),
             }
             auto_df = pd.DataFrame([auto_flags])
             st.caption("Auto-tags from transform")
@@ -1215,6 +1526,8 @@ def main() -> None:
                                 if entry.get("needs_review")
                                 else "pending"
                             ),
+                            "outcome": outcome_display(entry.get("outcome_alignment")),
+                            "follow_up": follow_up_display(entry.get("follow_up_need")),
                             "notes": entry.get("notes") or "",
                         }
                         for entry in existing_labels
@@ -1296,11 +1609,20 @@ def main() -> None:
             "notes": notes.strip() or None,
             "confidence": confidence,
             "evidence_sources": info_sources,
+            "outcome_alignment": outcome_alignment,
+            "follow_up_need": follow_up_need,
             "image_paths": record.get("image_paths"),
             "image_checksums": record.get("image_checksums"),
             "revision_of": prefill.get("label_id") if prefill else None,
         }
-        save_label(payload, supabase_client, enable_file_backup)
+        if save_label(payload, supabase_client, enable_file_backup):
+            st.session_state["undo_context"] = {
+                "label_id": label_id,
+                "request_id": req_id,
+                "previous_idx": idx,
+                "previous_prefill": deepcopy(prefill) if prefill else None,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
         st.session_state.idx = min(idx + 1, len(rows) - 1)
         reset_note_state()
         st.rerun()

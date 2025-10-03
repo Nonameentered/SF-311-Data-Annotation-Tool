@@ -26,3 +26,5 @@ data/eval/
 .streamlit/secrets.toml
 config/annotators.json
 supabase/.temp/
+supabase/config.toml
+supabase/config.prod.toml
