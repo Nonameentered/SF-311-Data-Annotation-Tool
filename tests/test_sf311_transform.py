@@ -9,6 +9,7 @@ def ensure_stub(name: str) -> None:
         return
     module = types.ModuleType(name)
     if name == "pandas":
+
         class DummyFrame(list):
             def to_parquet(self, *_, **__):
                 return None

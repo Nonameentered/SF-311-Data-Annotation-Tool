@@ -48,14 +48,14 @@ def test_subset_only_mine_returns_assigned_rows():
             {
                 "annotator_uid": "tester",
                 "timestamp": datetime.utcnow().isoformat(),
-                "priority": "P2",
+                "priority": "medium",
             }
         ],
         "2": [
             {
                 "annotator_uid": "someone_else",
                 "timestamp": datetime.utcnow().isoformat(),
-                "priority": "P3",
+                "priority": "low",
             }
         ],
     }

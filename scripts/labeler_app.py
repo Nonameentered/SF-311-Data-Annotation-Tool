@@ -12,8 +12,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 import streamlit as st
-from streamlit.errors import StreamlitSecretNotFoundError
+from streamlit.errors import StreamlitAPIException
 from streamlit_browser_storage import LocalStorage
+
+StreamlitSecretNotFoundError = StreamlitAPIException
 
 try:
     from supabase import Client, create_client
@@ -56,7 +58,38 @@ def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     return str(value) if value is not None else None
 
 
-SESSION_STORAGE = LocalStorage(key="supabase_session")
+def _build_session_storage(key: str):
+    try:
+        return LocalStorage(key=key)
+    except StreamlitAPIException:
+        # Fallback to an in-memory store so the UI stays stable even if the
+        # browser-storage component is unavailable (prevents flicker at sign-in).
+        class _InMemoryStorage:
+            def __init__(self, storage_key: str):
+                self._key = storage_key
+
+            def _ns(self, name: str) -> str:
+                return f"{self._key}:{name}"
+
+            def get(self, name: str):
+                return st.session_state.get(self._ns(name))
+
+            def set(self, name: str, value) -> None:
+                st.session_state[self._ns(name)] = value
+
+            def delete(self, name: str) -> None:
+                st.session_state.pop(self._ns(name), None)
+
+        if not st.session_state.get("_storage_warned", False):
+            st.session_state["_storage_warned"] = True
+            st.info(
+                "Browser session storage unavailable; Supabase login will reset on full refresh.",
+                icon="⚠️",
+            )
+        return _InMemoryStorage(key)
+
+
+SESSION_STORAGE = _build_session_storage("supabase_session")
 SESSION_TOKEN_NAME = "session_tokens"
 STATE_TOKEN_KEY = "sb_tokens"
 STATE_TOKEN_TRIES = "sb_token_load_tries"
@@ -206,8 +239,52 @@ FEATURE_DISPLAY_NAMES: Dict[str, str] = {
     "size_feet_bin": "Footprint (linear feet)",
 }
 
+PRIORITY_OPTIONS: Sequence[str] = ("High", "Medium", "Low")
+PRIORITY_STORAGE = {label: label.lower() for label in PRIORITY_OPTIONS}
+PRIORITY_LEGACY_MAP = {
+    "p1": "High",
+    "p2": "High",
+    "p3": "Medium",
+    "p4": "Low",
+}
+
+ROUTING_DEPARTMENTS: Sequence[str] = (
+    "SFHOT",
+    "HEART",
+    "Street Health",
+    "HSOC",
+    "DSS",
+    "DPW",
+    "Other",
+)
+
+SECONDARY_TEAM_OPTIONS: Sequence[str] = (
+    "SFHOT",
+    "HEART",
+    "Street Health",
+    "HSOC",
+    "DSS",
+    "DPW",
+    "HEART Team",
+    "Urban Alchemy",
+    "Community ambassadors",
+    "Other",
+)
+
+ROUTING_PARTNER_OPTIONS: Sequence[str] = (
+    "Community member",
+    "DPH",
+    "Street Services",
+    "Urban Alchemy",
+    "HEART Team",
+    "SSH",
+    "Other",
+)
+
+URGENCY_OPTIONS: Sequence[str] = ("Urgent", "Not urgent", "Unclear")
+
 LABEL_TIPS: Dict[str, str] = {
-    "priority": "P1 = life-threatening/immediate, P4 = informational only. Priorities should track urgency and resource need.",
+    "priority": "High = immediate response, Medium = timely but not emergent, Low = informational or deferrable.",
     "confidence": "How certain you are about the assigned priority/features based on available evidence.",
     "evidence_sources": "Select the sources you relied on (photos, notes, prior history, etc.).",
     "notes": "Capture rationale, escalation paths, or anomalies for reviewers.",
@@ -216,6 +293,12 @@ LABEL_TIPS: Dict[str, str] = {
     "label_status": "Mark `resolved` once the case has been adjudicated or synced into the gold set.",
     "outcome_alignment": "How the observed outcome aligns with expectations or service goals.",
     "follow_up_need": "Additional services that would help this case (multi-select).",
+    "routing_department": "Primary team you expect to handle the request.",
+    "routing_secondary": "Additional teams to involve if this case should be handed off.",
+    "routing_partners": "External partners or community groups involved in closure.",
+    "team_handoff": "Check when Team A is explicitly flagging Team B for support.",
+    "likely_goa": "Use when experience suggests the subject will be gone on arrival; add context in notes.",
+    "urgency_tag": "Quick flag annotators use internally to reflect perceived urgency.",
 }
 
 OUTCOME_OPTIONS: List[Tuple[str, str]] = [
@@ -1242,19 +1325,137 @@ def main() -> None:
                 value = fallback
             return options.index(value)
 
-        prio_options = ["P1", "P2", "P3", "P4"]
-        if prefill and prefill.get("priority") in prio_options:
-            prio_index = prio_options.index(prefill["priority"])
-        else:
-            prio_index = 2
-        prio = st.radio(
-            "Priority",
-            prio_options,
-            horizontal=True,
-            index=prio_index,
-            help=LABEL_TIPS["priority"],
-            key=widget_key("priority"),
+        def prefill_list(key: str) -> List[str]:
+            raw_value = initial_features.get(key)
+            if isinstance(raw_value, list):
+                return [str(item) for item in raw_value]
+            if raw_value is None:
+                return []
+            if isinstance(raw_value, tuple):
+                return [str(item) for item in raw_value]
+            if isinstance(raw_value, str) and raw_value:
+                return [raw_value]
+            return []
+
+        def prefill_int(key: str, fallback: int = 0) -> int:
+            raw_value = initial_features.get(key, fallback)
+            try:
+                return int(raw_value)
+            except (TypeError, ValueError):
+                return fallback
+
+        def resolve_priority_label(prefill_value: Optional[Any]) -> str:
+            if prefill_value is None:
+                return "Medium"
+            value_str = str(prefill_value).strip()
+            if value_str:
+                lowered = value_str.lower()
+                if lowered in PRIORITY_STORAGE.values():
+                    return value_str.title()
+                if lowered in PRIORITY_LEGACY_MAP:
+                    return PRIORITY_LEGACY_MAP[lowered]
+            return "Medium"
+
+        priority_label_default = resolve_priority_label(
+            prefill.get("priority") if prefill else None
         )
+        priority_index = PRIORITY_OPTIONS.index(priority_label_default)
+
+        routing_cols = st.columns([2.2, 1.2])
+        with routing_cols[0]:
+            priority_label = st.radio(
+                "Priority",
+                PRIORITY_OPTIONS,
+                horizontal=True,
+                index=priority_index,
+                help=LABEL_TIPS["priority"],
+                key=widget_key("priority"),
+            )
+
+            routing_default = initial_features.get("routing_department", "SFHOT")
+            if routing_default not in ROUTING_DEPARTMENTS:
+                routing_default = "SFHOT"
+            routing_department = st.selectbox(
+                "Routing department",
+                ROUTING_DEPARTMENTS,
+                index=ROUTING_DEPARTMENTS.index(routing_default),
+                help=LABEL_TIPS["routing_department"],
+                key=widget_key("routing_department"),
+            )
+
+            routing_other_default = str(initial_features.get("routing_other") or "")
+            routing_other = ""
+            if routing_department == "Other":
+                routing_other = st.text_input(
+                    "Describe routing",
+                    value=routing_other_default,
+                    key=widget_key("routing_other"),
+                )
+
+            secondary_default = [
+                option
+                for option in prefill_list("routing_secondary")
+                if option in SECONDARY_TEAM_OPTIONS
+            ]
+            secondary_teams = st.multiselect(
+                "Also flag",
+                SECONDARY_TEAM_OPTIONS,
+                default=secondary_default,
+                help=LABEL_TIPS["routing_secondary"],
+                key=widget_key("routing_secondary"),
+            )
+
+            partner_default = [
+                option
+                for option in prefill_list("routing_partners")
+                if option in ROUTING_PARTNER_OPTIONS
+            ]
+            routing_partners = st.multiselect(
+                "Closure handled by",
+                ROUTING_PARTNER_OPTIONS,
+                default=partner_default,
+                help=LABEL_TIPS["routing_partners"],
+                key=widget_key("routing_partners"),
+            )
+
+        with routing_cols[1]:
+            likely_goa = st.checkbox(
+                "Likely GOA",
+                value=bool(initial_features.get("likely_goa")),
+                help=LABEL_TIPS["likely_goa"],
+                key=widget_key("likely_goa"),
+            )
+
+            urgency_default = initial_features.get("urgency_tag", "Unclear")
+            if isinstance(urgency_default, str):
+                urgency_default = urgency_default.title()
+            if urgency_default not in URGENCY_OPTIONS:
+                urgency_default = "Unclear"
+            urgency_label = st.radio(
+                "Urgency tag",
+                URGENCY_OPTIONS,
+                index=URGENCY_OPTIONS.index(urgency_default),
+                help=LABEL_TIPS["urgency_tag"],
+                key=widget_key("urgency_tag"),
+            )
+
+            team_handoff = st.checkbox(
+                "Team handoff",
+                value=bool(initial_features.get("team_handoff")),
+                help=LABEL_TIPS["team_handoff"],
+                key=widget_key("team_handoff"),
+            )
+
+            reroute_count = st.number_input(
+                "Times rerouted",
+                min_value=0,
+                step=1,
+                value=prefill_int("reroute_count", 0),
+                key=widget_key("reroute_count"),
+            )
+
+        priority_value = PRIORITY_STORAGE[priority_label]
+        urgency_value = urgency_label.lower().replace(" ", "_")
 
         notes_val = (prefill.get("notes") if prefill else "") or ""
         if st.session_state.get(NOTE_REQ_KEY) != req_id:
@@ -1489,6 +1690,43 @@ def main() -> None:
                         follow_up_display(latest_any.get("follow_up_need")),
                     ),
                 )
+            summary_rows.insert(
+                1,
+                (
+                    "Routing department",
+                    (
+                        routing_department
+                        if routing_department != "Other"
+                        else f"Other ({routing_other or 'unspecified'})"
+                    ),
+                ),
+            )
+            summary_rows.insert(
+                2,
+                (
+                    "Secondary teams",
+                    ", ".join(secondary_teams) if secondary_teams else "—",
+                ),
+            )
+            summary_rows.insert(
+                3,
+                (
+                    "Routing partners",
+                    ", ".join(routing_partners) if routing_partners else "—",
+                ),
+            )
+            summary_rows.insert(
+                4,
+                ("Team handoff", "Yes" if team_handoff else "No"),
+            )
+            summary_rows.insert(
+                5,
+                ("Likely GOA", "Yes" if likely_goa else "No"),
+            )
+            summary_rows.insert(
+                6,
+                ("Urgency tag", urgency_label),
+            )
             summary_df = pd.DataFrame(summary_rows, columns=["Attribute", "Value"])
             st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
@@ -1520,6 +1758,21 @@ def main() -> None:
                             or entry.get("labels", {}).get("priority"),
                             "confidence": entry.get("confidence") or "",
                             "evidence": ", ".join(entry.get("evidence_sources") or []),
+                            "urgency": str(
+                                (entry.get("features") or {}).get("urgency_tag") or ""
+                            )
+                            .replace("_", " ")
+                            .title()
+                            or "—",
+                            "likely_goa": (
+                                "Yes"
+                                if (entry.get("features") or {}).get("likely_goa")
+                                else "No"
+                            ),
+                            "routing": (entry.get("features") or {}).get(
+                                "routing_department"
+                            )
+                            or "—",
                             "status": entry.get("status")
                             or (
                                 "needs_review"
@@ -1589,7 +1842,7 @@ def main() -> None:
             "annotator_display": annotator_display,
             "role": annotator_role,
             "timestamp": datetime.utcnow().isoformat(),
-            "priority": prio,
+            "priority": priority_value,
             "features": {
                 "lying_face_down": lying,
                 "safety_issue": safety,
@@ -1602,6 +1855,14 @@ def main() -> None:
                 "wheelchair": chair,
                 "num_people_bin": num_people_bin,
                 "size_feet_bin": size_feet_bin,
+                "likely_goa": bool(likely_goa),
+                "urgency_tag": urgency_value,
+                "routing_department": routing_department,
+                "routing_other": routing_other.strip() or None,
+                "routing_secondary": secondary_teams,
+                "routing_partners": routing_partners,
+                "team_handoff": bool(team_handoff),
+                "reroute_count": int(reroute_count),
             },
             "abstain": bool(abstain),
             "needs_review": bool(needs_review),

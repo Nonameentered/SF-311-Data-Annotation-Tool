@@ -33,17 +33,26 @@ DT_FORMATS = (
     "%Y-%m-%d",
 )
 
-PHOTO_KEYS = ("photos","photo_urls","media_url","media_urls","image_urls")
+PHOTO_KEYS = ("photos", "photo_urls", "media_url", "media_urls", "image_urls")
+
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Raw SF311 file (API-wrapped, JSON, or JSONL)")
+    ap.add_argument(
+        "--input", required=True, help="Raw SF311 file (API-wrapped, JSON, or JSONL)"
+    )
     ap.add_argument("--jsonl", required=True, help="Output JSONL path")
     ap.add_argument("--parquet", help="Optional Parquet output path")
     ap.add_argument("--csv", help="Optional CSV output path")
-    ap.add_argument("--size-max", type=float, default=400.0, help="Clip tag_size_feet to [0, size-max]")
+    ap.add_argument(
+        "--size-max",
+        type=float,
+        default=400.0,
+        help="Clip tag_size_feet to [0, size-max]",
+    )
     ap.add_argument("--manifest", help="Image manifest JSONL from fetch-images")
     return ap.parse_args()
+
 
 def load_records(path: Path) -> List[Dict[str, Any]]:
     raw = path.read_text(encoding="utf-8", errors="replace").strip()
@@ -81,22 +90,32 @@ def load_records(path: Path) -> List[Dict[str, Any]]:
         return recs
     raise ValueError("Unrecognized input format")
 
+
 def to_bool(x: Any) -> Optional[bool]:
-    if isinstance(x, bool): return x
-    if x is None: return None
+    if isinstance(x, bool):
+        return x
+    if x is None:
+        return None
     s = str(x).strip().lower()
-    if s in {"true","t","yes","y","1"}: return True
-    if s in {"false","f","no","n","0"}: return False
+    if s in {"true", "t", "yes", "y", "1"}:
+        return True
+    if s in {"false", "f", "no", "n", "0"}:
+        return False
     return None
 
+
 def to_num(x: Any) -> Optional[float]:
-    if x is None: return None
-    if isinstance(x, (int, float)): return float(x)
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
     m = re.search(r"[-+]?\d+(\.\d+)?", str(x))
     return float(m.group(0)) if m else None
 
+
 def parse_dt(x: Any) -> Optional[str]:
-    if not x: return None
+    if not x:
+        return None
     s = str(x)
     for fmt in DT_FORMATS:
         try:
@@ -105,6 +124,7 @@ def parse_dt(x: Any) -> Optional[str]:
         except Exception:
             continue
     return None
+
 
 def collect_image_urls(rec: Dict[str, Any]) -> list[str]:
     urls = []
@@ -115,10 +135,12 @@ def collect_image_urls(rec: Dict[str, Any]) -> list[str]:
         elif isinstance(v, str) and v.strip():
             urls.append(v)
     # de-dup
-    seen = set(); out = []
+    seen = set()
+    out = []
     for u in urls:
         if u not in seen:
-            seen.add(u); out.append(u)
+            seen.add(u)
+            out.append(u)
     return out
 
 
@@ -146,6 +168,7 @@ def load_manifest(path: Optional[Path]) -> Dict[Tuple[str, str], Dict[str, Any]]
             mapping[(req_id, url)] = rec
     return mapping
 
+
 def extract_text_feats(txt: str) -> Dict[str, Any]:
     if not txt:
         feats = {"desc_len": 0}
@@ -156,8 +179,11 @@ def extract_text_feats(txt: str) -> Dict[str, Any]:
         feats[f"kw_{k}"] = bool(pat.search(txt))
     return feats
 
+
 def normalize_record(
-    rec: Dict[str, Any], size_max: float, manifest: Dict[Tuple[str, str], Dict[str, Any]]
+    rec: Dict[str, Any],
+    size_max: float,
+    manifest: Dict[Tuple[str, str], Dict[str, Any]],
 ) -> Dict[str, Any]:
     tags = rec.get("homeless_tags") or {}
     text = (rec.get("description") or "").strip()
@@ -207,8 +233,11 @@ def normalize_record(
         **feats,
         "tag_safety_issue": to_bool(tags.get("safety_issue")),
         "tag_drugs": to_bool(tags.get("drugs")),
-        "tag_person_position": (str(tags.get("person_position")).strip().lower()
-                                if tags.get("person_position") is not None else None),
+        "tag_person_position": (
+            str(tags.get("person_position")).strip().lower()
+            if tags.get("person_position") is not None
+            else None
+        ),
         "tag_lying_face_down": to_bool(tags.get("person_lying_face_down_on_sidewalk")),
         "tag_tents_present": to_bool(tags.get("tents_or_makeshift_present")),
         "tag_size_feet": to_num(tags.get("size_feet")),
@@ -227,15 +256,19 @@ def normalize_record(
         except Exception:
             out["hours_to_resolution"] = None
     if out["tag_size_feet"] is not None:
-        out["tag_size_feet"] = max(0.0, min(float(out["tag_size_feet"]), float(size_max)))
+        out["tag_size_feet"] = max(
+            0.0, min(float(out["tag_size_feet"]), float(size_max))
+        )
     if out["tag_num_people"] is not None:
         out["tag_num_people"] = max(0.0, min(float(out["tag_num_people"]), 25.0))
     return out
 
+
 def main():
     args = parse_args()
     inp = Path(args.input)
-    out_jsonl = Path(args.jsonl); out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    out_jsonl = Path(args.jsonl)
+    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     manifest_path = Path(args.manifest) if args.manifest else None
     manifest = load_manifest(manifest_path)
     rows = [normalize_record(r, args.size_max, manifest) for r in load_records(inp)]
@@ -245,13 +278,16 @@ def main():
     print(f"[green][ok][/green] wrote JSONL: {out_jsonl} ({len(rows):,} rows)")
     df = pd.DataFrame(rows)
     if args.parquet:
-        p = Path(args.parquet); p.parent.mkdir(parents=True, exist_ok=True)
+        p = Path(args.parquet)
+        p.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(p, index=False)
         print(f"[green][ok][/green] wrote Parquet: {p}")
     if args.csv:
-        p = Path(args.csv); p.parent.mkdir(parents=True, exist_ok=True)
+        p = Path(args.csv)
+        p.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(p, index=False)
         print(f"[green][ok][/green] wrote CSV: {p}")
+
 
 if __name__ == "__main__":
     main()

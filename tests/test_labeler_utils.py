@@ -12,20 +12,20 @@ LABELS = [
     {
         "annotator_uid": "11111111-1111-1111-1111-111111111111",
         "annotator": "alice",
-        "priority": "P1",
+        "priority": "high",
         "timestamp": "2024-01-01T10:00:00",
     },
     {
         "annotator_uid": "22222222-2222-2222-2222-222222222222",
         "annotator": "bob",
-        "priority": "P2",
+        "priority": "medium",
         "timestamp": "2024-01-01T11:00:00",
         "needs_review": True,
     },
     {
         "annotator_uid": "33333333-3333-3333-3333-333333333333",
         "annotator": "carol",
-        "priority": "P2",
+        "priority": "medium",
         "timestamp": "2024-01-01T12:00:00",
     },
 ]
@@ -51,7 +51,7 @@ def test_can_label_limit_three():
 def test_latest_label_for_annotator():
     latest = latest_label_for_annotator(LABELS, "22222222-2222-2222-2222-222222222222")
     assert latest is not None
-    assert latest["priority"] == "P2"
+    assert latest["priority"] == "medium"
 
 
 def test_password_hash_and_verify():

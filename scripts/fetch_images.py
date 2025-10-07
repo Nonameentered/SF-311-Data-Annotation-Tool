@@ -19,14 +19,20 @@ USER_AGENT = "sf311-labeler/0.1 (https://example.com)"
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Download and cache SF311 report images")
-    ap.add_argument("--input", required=True, help="Transformed JSONL file that includes image URLs")
-    ap.add_argument("--out-dir", default="data/images", help="Where to store cached images")
+    ap.add_argument(
+        "--input", required=True, help="Transformed JSONL file that includes image URLs"
+    )
+    ap.add_argument(
+        "--out-dir", default="data/images", help="Where to store cached images"
+    )
     ap.add_argument(
         "--manifest",
         default=None,
         help="Manifest path (defaults to <out_dir>/manifest.jsonl)",
     )
-    ap.add_argument("--max-workers", type=int, default=8, help="Concurrent download workers")
+    ap.add_argument(
+        "--max-workers", type=int, default=8, help="Concurrent download workers"
+    )
     ap.add_argument(
         "--rewrite",
         action="store_true",
