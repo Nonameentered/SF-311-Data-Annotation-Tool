@@ -15,7 +15,7 @@ This roadmap focuses on delivering a production-ready Supabase + Streamlit label
 - **Layout principle**: adopt a balanced 60/40 split (images vs. decision pane) and prepare for future view presets (“Image focus” vs. “Context focus”).
 - **Snapshot ribbon**: insert a fixed row under the header summarising `Status`, `Time to resolution`, `Last updated`, and an outcome snippet. Implement via a sticky `st.container()` around the existing metrics block.
 - **Right panel cards**:
-  - *Decision card*: priority, confidence, information sources, save/skip buttons, hotkeys.
+  - *Decision card*: priority, GOA expectation bucket, information sources, save/skip buttons, hotkeys.
   - *Status card*: open/closed badge, closure notes, post-closure notes, after-action link.
   Move current widgets into these sections and trim redundant info from the “Summary” tab.
 - **Outcome highlight**: generate a short sentence (e.g., “Closed after 6h → Outreach team dispatched”) so social workers see results immediately.

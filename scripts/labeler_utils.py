@@ -55,22 +55,48 @@ def unique_annotators(labels: List[Dict]) -> List[str]:
     return seen
 
 
-def request_status(labels: List[Dict]) -> str:
+def request_status(labels: List[Dict], required_unique: int = 2) -> str:
     if not labels:
         return "unlabeled"
-    if any(
-        bool(l.get("needs_review")) or l.get("status") == "needs_review" for l in labels
-    ):
+    ordered = sort_labels(labels)
+    annotators = unique_annotators(ordered)
+    review_statuses = [
+        (str(l.get("review_status")) if l.get("review_status") is not None else "")
+        .strip()
+        .lower()
+        for l in ordered
+    ]
+
+    if any(status == "disagree" for status in review_statuses):
         return "needs_review"
-    priorities = {l.get("priority") for l in labels if l.get("priority")}
+
+    priorities = {
+        str(l.get("priority")).strip().lower()
+        for l in ordered
+        if l.get("priority") is not None
+        and str(l.get("priority")).strip() != ""
+    }
     if len(priorities) > 1:
-        return "conflict"
+        return "needs_review"
+
+    reviewers_present = any(status == "agree" for status in review_statuses)
+    if len(annotators) < required_unique or not reviewers_present:
+        return "needs_review"
+
     return "labeled"
 
 
 def latest_label_for_annotator(labels: List[Dict], annotator: str) -> Optional[Dict]:
     annotator = str(annotator)
     matching = [l for l in labels if _label_uid(l) == annotator]
+    if not matching:
+        return None
+    return sort_labels(matching)[-1]
+
+
+def latest_label_excluding(labels: List[Dict], annotator: str) -> Optional[Dict]:
+    annotator = str(annotator)
+    matching = [l for l in labels if _label_uid(l) != annotator]
     if not matching:
         return None
     return sort_labels(matching)[-1]

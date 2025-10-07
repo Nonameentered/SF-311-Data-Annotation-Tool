@@ -11,8 +11,7 @@ Create a `.env` (local) or use Streamlit secrets / deployment secrets with the f
 
 ```
 SUPABASE_URL=https://<project>.supabase.co
-SUPABASE_PUBLISHABLE_KEY=<publishable-key>
-# If your project has not migrated yet, set SUPABASE_ANON_KEY instead.
+SUPABASE_SECRET_KEY=sb_secret_<...>
 LABELS_JSONL_BACKUP=0
 LABELER_DATA_DIR=/app/data
 LABELS_OUTPUT_DIR=/app/data/labels
@@ -20,11 +19,11 @@ MAX_ANNOTATORS_PER_REQUEST=3
 ```
 
 For Streamlit Cloud, add the same values to `.streamlit/secrets.toml` or the cloud dashboard. Because `LABELS_JSONL_BACKUP` defaults to `0` when Supabase is configured, production runs will avoid writing local JSONL copies.
-If you temporarily supply a service-role key for local testing, rotate it and remove it from secrets before deploying.
+Rotate the Supabase secret key periodically and avoid storing publishable/anon keys in the deployment—the app now requires the server-side secret to write labels while Auth0 handles auth.
 
 GitHub repository secrets required by CI/CD:
 - `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY` (only for server-side jobs that require elevated privileges) or `SUPABASE_ANON_KEY` for read/write tests
+- `SUPABASE_SECRET_KEY`
 - `LABELS_JSONL_BACKUP` set to `0`
 - Any storage credentials needed for image fetches (e.g., `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` if pulling from private S3)
 
@@ -50,6 +49,6 @@ Make sure your repository secrets supply the Supabase keys and any other credent
 
 ## 5. Ongoing Operations
 - Schedule the GitHub Actions workflow (already configured) to keep transformed data and audit snapshots fresh.
-- Use Supabase SQL or the Dashboard to reconcile conflicts and export gold splits (e.g., `COPY (SELECT * FROM labels WHERE status = 'resolved') TO ...`).
+- Use Supabase SQL or the Dashboard to reconcile pending reviews and export gold splits (e.g., `COPY (SELECT * FROM labels WHERE review_status = 'agree') TO ...`).
 - Monitor Supabase auth logs and storage metrics. Consider enabling Row Level Security logs for auditing annotator activity.
 - Keep the migrations under `supabase/migrations/` in sync with schema changes; run `supabase db push` whenever you add columns or adjust policies.

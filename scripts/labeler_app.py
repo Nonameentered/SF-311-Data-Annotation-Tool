@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import hashlib
 import json
 import os
-import random
 import sys
 import uuid
 from copy import deepcopy
@@ -13,7 +13,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import pandas as pd
 import streamlit as st
 from streamlit.errors import StreamlitAPIException
-from streamlit_browser_storage import LocalStorage
+
+APP_TITLE = "SF311 Priority Labeler — Human-in-the-Loop"
 
 StreamlitSecretNotFoundError = StreamlitAPIException
 
@@ -35,13 +36,12 @@ if str(ROOT) not in sys.path:
 from scripts.labeler_utils import (
     can_annotator_label,
     latest_label_for_annotator,
+    latest_label_excluding,
     parse_iso,
     request_status,
     sort_labels,
     unique_annotators,
 )
-
-APP_TITLE = "SF311 Priority Labeler — Human-in-the-Loop"
 
 
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -58,118 +58,6 @@ def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     return str(value) if value is not None else None
 
 
-def _build_session_storage(key: str):
-    try:
-        return LocalStorage(key=key)
-    except StreamlitAPIException:
-        # Fallback to an in-memory store so the UI stays stable even if the
-        # browser-storage component is unavailable (prevents flicker at sign-in).
-        class _InMemoryStorage:
-            def __init__(self, storage_key: str):
-                self._key = storage_key
-
-            def _ns(self, name: str) -> str:
-                return f"{self._key}:{name}"
-
-            def get(self, name: str):
-                return st.session_state.get(self._ns(name))
-
-            def set(self, name: str, value) -> None:
-                st.session_state[self._ns(name)] = value
-
-            def delete(self, name: str) -> None:
-                st.session_state.pop(self._ns(name), None)
-
-        if not st.session_state.get("_storage_warned", False):
-            st.session_state["_storage_warned"] = True
-            st.info(
-                "Browser session storage unavailable; Supabase login will reset on full refresh.",
-                icon="⚠️",
-            )
-        return _InMemoryStorage(key)
-
-
-SESSION_STORAGE = _build_session_storage("supabase_session")
-SESSION_TOKEN_NAME = "session_tokens"
-STATE_TOKEN_KEY = "sb_tokens"
-STATE_TOKEN_TRIES = "sb_token_load_tries"
-
-
-def load_tokens_from_storage() -> Optional[Dict[str, str]]:
-    tokens = st.session_state.get(STATE_TOKEN_KEY)
-    if (
-        isinstance(tokens, dict)
-        and tokens.get("access_token")
-        and tokens.get("refresh_token")
-    ):
-        st.session_state[STATE_TOKEN_TRIES] = 0
-        return tokens
-    try:
-        stored = SESSION_STORAGE.get(SESSION_TOKEN_NAME)
-    except Exception:
-        stored = None
-    if (
-        isinstance(stored, dict)
-        and stored.get("access_token")
-        and stored.get("refresh_token")
-    ):
-        st.session_state[STATE_TOKEN_KEY] = stored
-        st.session_state[STATE_TOKEN_TRIES] = 0
-        return stored
-    st.session_state[STATE_TOKEN_TRIES] = st.session_state.get(STATE_TOKEN_TRIES, 0) + 1
-    return None
-
-
-def save_tokens(access_token: str, refresh_token: str) -> None:
-    tokens = {"access_token": access_token, "refresh_token": refresh_token}
-    st.session_state[STATE_TOKEN_KEY] = tokens
-    st.session_state[STATE_TOKEN_TRIES] = 0
-    try:
-        SESSION_STORAGE.set(SESSION_TOKEN_NAME, tokens)
-    except Exception:
-        pass
-
-
-def clear_tokens() -> None:
-    st.session_state.pop(STATE_TOKEN_KEY, None)
-    st.session_state[STATE_TOKEN_TRIES] = 0
-    try:
-        SESSION_STORAGE.delete(SESSION_TOKEN_NAME)
-    except Exception:
-        pass
-
-
-def restore_supabase_session(
-    client: Client,
-) -> None:  # pragma: no cover - requires Supabase
-    tokens = load_tokens_from_storage()
-    if not tokens:
-        return
-    try:
-        session_result = client.auth.set_session(
-            tokens["access_token"], tokens["refresh_token"]
-        )
-        current = (
-            session_result.session if session_result else client.auth.get_session()
-        )
-        if current and current.access_token and current.refresh_token:
-            save_tokens(current.access_token, current.refresh_token)
-        if "sb_session" not in st.session_state:
-            user_resp = client.auth.get_user()
-            user = getattr(user_resp, "user", None)
-            if user is not None:
-                metadata = getattr(user, "user_metadata", {}) or {}
-                profile = {
-                    "id": user.id,
-                    "email": user.email,
-                    "name": metadata.get("display_name") or user.email,
-                    "role": metadata.get("role", "annotator"),
-                }
-                st.session_state["sb_session"] = profile
-    except Exception:
-        clear_tokens()
-
-
 DATA = Path(get_secret("LABELER_DATA_DIR", "data"))
 RAW = DATA / "transformed.jsonl"
 LABELS_DIR = Path(get_secret("LABELS_OUTPUT_DIR", str(DATA / "labels")))
@@ -177,21 +65,21 @@ MAX_ANNOTATORS = int(get_secret("MAX_ANNOTATORS_PER_REQUEST", "3"))
 SUPABASE_URL = get_secret("SUPABASE_URL")
 SUPABASE_PUBLISHABLE_KEY = get_secret("SUPABASE_PUBLISHABLE_KEY")
 SUPABASE_ANON_KEY = get_secret("SUPABASE_ANON_KEY")
-SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY")
-SUPABASE_KEY = (
-    SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY
-)
-SUPABASE_KEY_KIND = None
-if SUPABASE_KEY:
-    if SUPABASE_KEY == SUPABASE_SERVICE_ROLE_KEY:
-        SUPABASE_KEY_KIND = "service"
-    elif SUPABASE_KEY == SUPABASE_PUBLISHABLE_KEY:
-        SUPABASE_KEY_KIND = "publishable"
-    else:
-        SUPABASE_KEY_KIND = "anon"
+SUPABASE_SECRET_KEY = get_secret("SUPABASE_SECRET_KEY")
+if SUPABASE_SECRET_KEY:
+    SUPABASE_KEY = SUPABASE_SECRET_KEY
+    SUPABASE_KEY_KIND = "secret"
+elif SUPABASE_ANON_KEY:
+    SUPABASE_KEY = SUPABASE_ANON_KEY
+    SUPABASE_KEY_KIND = "anon"
+elif SUPABASE_PUBLISHABLE_KEY:
+    SUPABASE_KEY = SUPABASE_PUBLISHABLE_KEY
+    SUPABASE_KEY_KIND = "publishable"
+else:
+    SUPABASE_KEY = None
+    SUPABASE_KEY_KIND = None
 BACKUP_SETTING = get_secret("LABELS_JSONL_BACKUP")
-
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+REQUIRED_UNIQUE_FOR_COMPLETION = max(1, min(MAX_ANNOTATORS, 2))
 st.markdown(
     """
     <style>
@@ -215,7 +103,7 @@ FEATURE_TIPS: Dict[str, str] = {
     "lying_face_down": "Report indicates someone is prone or face down on the ground.",
     "safety_issue": "Flags imminent safety hazards (traffic, violence, weapons).",
     "drugs": "Evidence of drug use or paraphernalia on scene.",
-    "tents_present": "Tents, makeshift shelters, or similar structures present.",
+    "tents_count": "Estimate how many tents or makeshift structures are visible.",
     "blocking": "Belongings or people are obstructing the right of way (sidewalk/road).",
     "on_ramp": "Located on or immediately adjacent to a freeway on/off ramp.",
     "propane_or_flame": "Propane tanks, open flames, or generators noted.",
@@ -229,14 +117,15 @@ FEATURE_DISPLAY_NAMES: Dict[str, str] = {
     "lying_face_down": "Person lying face down",
     "safety_issue": "Immediate safety issue",
     "drugs": "Drug use or paraphernalia",
-    "tents_present": "Tents or structures present",
+    "tents_present": "Auto flag: tents present",
+    "tents_count": "# of tents",
     "blocking": "Blocking right-of-way",
     "on_ramp": "Near freeway on/off ramp",
     "propane_or_flame": "Propane, open flame, or generator",
     "children_present": "Children present",
     "wheelchair": "Mobility device mentioned",
-    "num_people_bin": "Estimated number of people",
-    "size_feet_bin": "Footprint (linear feet)",
+    "num_people_bin": "Est. # of people",
+    "size_feet_bin": "Est. footprint (feet)",
 }
 
 PRIORITY_OPTIONS: Sequence[str] = ("High", "Medium", "Low")
@@ -248,6 +137,16 @@ PRIORITY_LEGACY_MAP = {
     "p4": "Low",
 }
 
+GOA_WINDOW_OPTIONS: Sequence[Tuple[str, str]] = (
+    ("unknown", "Unsure"),
+    ("respond_sub2h", "Respond within 2h to avoid GOA"),
+    ("respond_2_6h", "Respond within 6h to avoid GOA"),
+    ("respond_6_24h", "Respond within 24h to avoid GOA"),
+    ("respond_over_24h", "Low GOA risk (>24h)"),
+)
+GOA_WINDOW_VALUES = [value for value, _ in GOA_WINDOW_OPTIONS]
+GOA_WINDOW_LABELS = {value: label for value, label in GOA_WINDOW_OPTIONS}
+
 ROUTING_DEPARTMENTS: Sequence[str] = (
     "SFHOT",
     "HEART",
@@ -255,50 +154,20 @@ ROUTING_DEPARTMENTS: Sequence[str] = (
     "HSOC",
     "DSS",
     "DPW",
+    "Unknown",
     "Other",
 )
-
-SECONDARY_TEAM_OPTIONS: Sequence[str] = (
-    "SFHOT",
-    "HEART",
-    "Street Health",
-    "HSOC",
-    "DSS",
-    "DPW",
-    "HEART Team",
-    "Urban Alchemy",
-    "Community ambassadors",
-    "Other",
-)
-
-ROUTING_PARTNER_OPTIONS: Sequence[str] = (
-    "Community member",
-    "DPH",
-    "Street Services",
-    "Urban Alchemy",
-    "HEART Team",
-    "SSH",
-    "Other",
-)
-
-URGENCY_OPTIONS: Sequence[str] = ("Urgent", "Not urgent", "Unclear")
 
 LABEL_TIPS: Dict[str, str] = {
     "priority": "High = immediate response, Medium = timely but not emergent, Low = informational or deferrable.",
-    "confidence": "How certain you are about the assigned priority/features based on available evidence.",
     "evidence_sources": "Select the sources you relied on (photos, notes, prior history, etc.).",
     "notes": "Capture rationale, escalation paths, or anomalies for reviewers.",
-    "abstain": "Use when context is insufficient to label confidently.",
-    "needs_review": "Flag items that require supervisor follow-up or contain conflicting info.",
-    "label_status": "Mark `resolved` once the case has been adjudicated or synced into the gold set.",
     "outcome_alignment": "How the observed outcome aligns with expectations or service goals.",
     "follow_up_need": "Additional services that would help this case (multi-select).",
     "routing_department": "Primary team you expect to handle the request.",
-    "routing_secondary": "Additional teams to involve if this case should be handed off.",
-    "routing_partners": "External partners or community groups involved in closure.",
-    "team_handoff": "Check when Team A is explicitly flagging Team B for support.",
-    "likely_goa": "Use when experience suggests the subject will be gone on arrival; add context in notes.",
-    "urgency_tag": "Quick flag annotators use internally to reflect perceived urgency.",
+    "goa_window": "Estimate when the subject might be gone if a team deploys now. Use the bucket that best fits your expectation.",
+    "review_status": "Choose whether you agree with the previous annotator or believe adjustments are needed.",
+    "review_notes": "Explain disagreements or add missing context so the prior label can be audited.",
 }
 
 OUTCOME_OPTIONS: List[Tuple[str, str]] = [
@@ -337,10 +206,15 @@ TAG_FILTER_OPTIONS: List[Tuple[str, str]] = [
 STATUS_FILTER_OPTIONS: List[str] = [
     "unlabeled",
     "needs_review",
-    "conflict",
     "labeled",
     "all",
 ]
+
+REVIEW_STATUS_LABELS: Dict[str, str] = {
+    "pending": "Not reviewed",
+    "agree": "Agree with previous assessment",
+    "disagree": "Disagree / needs change",
+}
 
 
 def outcome_display(value: Optional[str]) -> str:
@@ -364,6 +238,26 @@ def follow_up_display(values: Optional[Sequence[str]]) -> str:
         else:
             labels.append(str(item))
     return ", ".join(labels)
+
+
+def resolve_goa_window(features: Dict[str, Any]) -> str:
+    raw = features.get("goa_window") if isinstance(features, dict) else None
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in GOA_WINDOW_VALUES:
+            return normalized
+    return "unknown"
+
+
+def goa_window_label(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    return GOA_WINDOW_LABELS.get(normalized, normalized.replace("_", " ").title())
+
+
+def user_random_value(request_id: Any, annotator_uid: str) -> float:
+    base = f"{request_id}:{annotator_uid}".encode("utf-8", "ignore")
+    digest = hashlib.sha256(base).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
 
 
 FIELD_GLOSSARY: Dict[str, str] = {
@@ -499,33 +393,25 @@ def format_duration_hours(value: Any) -> str:
 
 
 def get_supabase_client() -> Optional[Client]:
-    if not SUPABASE_URL or not SUPABASE_KEY or create_client is None:
-        if not SUPABASE_URL:
-            st.error(
-                "SUPABASE_URL is not configured. Add it to Streamlit secrets or environment variables."
-            )
-        elif not SUPABASE_KEY:
-            st.error(
-                "Supabase key is missing. Provide SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY in secrets/environment."
-            )
-        elif create_client is None:
-            st.error(
-                "supabase-py is not installed. Run 'uv add supabase' or sync dependencies via 'make init'."
-            )
-        return None
-    if SUPABASE_KEY_KIND == "service" and not st.session_state.get(
-        "_service_key_warned", False
-    ):
-        st.warning(
-            "Streamlit is using a Supabase service-role key. Switch to a publishable/anon key for client-side sessions.",
+    if create_client is None:
+        st.error(
+            "supabase-py is not installed. Run 'uv add supabase' or sync dependencies via 'make init'."
         )
-        st.session_state["_service_key_warned"] = True
+        return None
+    if not SUPABASE_URL:
+        st.error(
+            "SUPABASE_URL is not configured. Add it to Streamlit secrets or environment variables."
+        )
+        return None
+    if SUPABASE_KEY_KIND != "secret":
+        st.error(
+            "Provide SUPABASE_SECRET_KEY in secrets/environment so the app can write labels while using external auth."
+        )
+        return None
     try:
-        client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        restore_supabase_session(client)
-        return client
-    except Exception:
-        st.error("Failed to initialize Supabase client. Falling back to file storage.")
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as exc:
+        st.error(f"Failed to initialize Supabase client: {exc}")
         return None
 
 
@@ -676,7 +562,6 @@ def record_feature_defaults(record: Dict[str, Any]) -> Dict[str, Any]:
         "lying_face_down": record.get("tag_lying_face_down") is True,
         "safety_issue": record.get("tag_safety_issue") is True,
         "drugs": record.get("tag_drugs") is True,
-        "tents_present": record.get("tag_tents_present") is True,
         "blocking": bool_default(record.get("kw_blocking")),
         "on_ramp": bool_default(record.get("kw_onramp")),
         "propane_or_flame": bool_default(record.get("kw_propane"))
@@ -711,127 +596,13 @@ def record_feature_defaults(record: Dict[str, Any]) -> Dict[str, Any]:
         else:
             defaults["size_feet_bin"] = "150+"
 
+    tents_value = record.get("tag_tents_present")
+    if isinstance(tents_value, (int, float)):
+        defaults["tents_count"] = max(int(tents_value), 0)
+    elif isinstance(tents_value, bool):
+        defaults["tents_count"] = 1 if tents_value else 0
+
     return {k: v for k, v in defaults.items() if v is not None}
-
-
-def authenticate_supabase(
-    client: Client,
-) -> Optional[Dict[str, Any]]:  # pragma: no cover - requires Supabase
-    session = st.session_state.get("sb_session")
-    if session:
-        return session
-
-    if st.session_state.get(STATE_TOKEN_TRIES, 0) == 1:
-        st.info("Restoring session…")
-        st.stop()
-
-    notice = st.session_state.pop("sb_notice", None)
-    if notice:
-        level, message = notice
-        if level == "success":
-            st.success(message)
-        elif level == "error":
-            st.error(message)
-        else:
-            st.info(message)
-
-    tab_login, tab_signup = st.tabs(["Sign in", "Sign up"])
-
-    with tab_login:
-        st.subheader("Sign in")
-        with st.form("supabase_signin"):
-            email = st.text_input("Email", key="signin_email")
-            password = st.text_input("Password", type="password", key="signin_password")
-            submitted = st.form_submit_button("Sign in", type="primary")
-            if submitted:
-                try:
-                    result = client.auth.sign_in_with_password(
-                        {"email": email.strip(), "password": password}
-                    )
-                    user = result.user
-                    if user is None:
-                        st.error(
-                            "Sign in failed. Check credentials or verify your email."
-                        )
-                    else:
-                        if (
-                            result.session
-                            and result.session.access_token
-                            and result.session.refresh_token
-                        ):
-                            save_tokens(
-                                result.session.access_token,
-                                result.session.refresh_token,
-                            )
-                        profile = {
-                            "id": user.id,
-                            "email": user.email,
-                            "name": user.user_metadata.get("display_name")
-                            or user.email,
-                            "role": user.user_metadata.get("role", "annotator"),
-                        }
-                        st.session_state["sb_session"] = profile
-                        st.rerun()
-                except Exception as exc:
-                    st.error(f"Sign in error: {exc}")
-
-    with tab_signup:
-        st.subheader("Create account")
-        with st.form("supabase_signup"):
-            email = st.text_input("Email", key="signup_email")
-            password = st.text_input("Password", type="password", key="signup_password")
-            display_name = st.text_input(
-                "Display name (shown in app)", key="signup_display_name"
-            )
-            submitted = st.form_submit_button("Sign up")
-            if submitted:
-                try:
-                    result = client.auth.sign_up(
-                        {
-                            "email": email.strip(),
-                            "password": password,
-                            "options": {
-                                "data": {
-                                    "display_name": display_name.strip(),
-                                    "role": "annotator",
-                                }
-                            },
-                        }
-                    )
-                    user = result.user
-                    session_resp = getattr(result, "session", None)
-                    email_confirmed = False
-                    if session_resp and getattr(session_resp, "access_token", None):
-                        email_confirmed = True
-                    if user is not None and getattr(user, "email_confirmed_at", None):
-                        email_confirmed = True
-
-                    if not email_confirmed:
-                        st.session_state["sb_notice"] = (
-                            "info",
-                            "Verification email sent. Confirm your address, then return to sign in.",
-                        )
-                        st.rerun()
-                    else:
-                        if (
-                            result.session
-                            and result.session.access_token
-                            and result.session.refresh_token
-                        ):
-                            save_tokens(
-                                result.session.access_token,
-                                result.session.refresh_token,
-                            )
-                        st.session_state["sb_notice"] = (
-                            "success",
-                            "Account created. You can sign in now.",
-                        )
-                        st.rerun()
-                except Exception as exc:
-                    st.error(f"Sign up error: {exc}")
-
-    st.stop()
-    return None
 
 
 def subset(
@@ -870,7 +641,7 @@ def subset(
             continue
         rid = str(r.get("request_id"))
         labels = labels_by_request.get(rid, [])
-        req_status = request_status(labels)
+        req_status = request_status(labels, REQUIRED_UNIQUE_FOR_COMPLETION)
         if desired != "all" and req_status != desired:
             if desired == "unlabeled" and req_status == "unlabeled":
                 pass
@@ -909,24 +680,27 @@ def main() -> None:
     if supabase_client is None:
         st.stop()
 
-    user = authenticate_supabase(supabase_client)
-    if user is None:
-        if (
-            st.session_state.get(STATE_TOKEN_TRIES, 0) > 0
-            and st.session_state.get(STATE_TOKEN_TRIES, 0) <= 1
-        ):
-            st.info("Restoring session…")
-            st.stop()
+    if not st.user.is_logged_in:
+        st.title(APP_TITLE)
+        st.caption("Log in with Auth0 to continue.")
+        st.button("Log in", type="primary", on_click=st.login)
         st.stop()
 
-    annotator_uid = str(user.get("id"))
-    annotator_role = user.get("role", "annotator")
-    annotator_display = (
-        user.get("name")
-        or user.get("display_name")
-        or user.get("email")
-        or annotator_uid
+    session_user = st.user
+    raw_email = (getattr(session_user, "email", "") or "").strip()
+    user_email = raw_email.lower()
+    identity_source = (
+        getattr(session_user, "id", None)
+        or raw_email
+        or getattr(session_user, "username", None)
+        or getattr(session_user, "name", None)
+        or str(uuid.uuid4())
     )
+    annotator_uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"auth:{identity_source}"))
+    annotator_display = (
+        getattr(session_user, "name", None) or raw_email or annotator_uid
+    )
+    annotator_role = "reviewer"
 
     NOTE_STATE_KEY = "note_text"
     NOTE_REQ_KEY = "note_text_request_id"
@@ -934,6 +708,11 @@ def main() -> None:
     def reset_note_state() -> None:
         st.session_state.pop(NOTE_STATE_KEY, None)
         st.session_state.pop(NOTE_REQ_KEY, None)
+
+    identity_parts = [annotator_display]
+    if raw_email and raw_email.lower() != annotator_display.lower():
+        identity_parts.append(raw_email)
+    st.sidebar.caption(f"Signed in as {' · '.join(identity_parts)}")
 
     undo_context = st.session_state.get("undo_context")
     if undo_context:
@@ -966,12 +745,9 @@ def main() -> None:
                 st.rerun()
 
     if st.sidebar.button("Log out"):
-        try:
-            supabase_client.auth.sign_out()
-        except Exception:
-            pass
-        st.session_state.pop("sb_session", None)
-        clear_tokens()
+        st.logout()
+        st.session_state.pop("undo_context", None)
+        st.session_state.pop("prefill", None)
         st.rerun()
 
     rows_all = load_rows(RAW)
@@ -992,8 +768,6 @@ def main() -> None:
                     "request_id": str(rid),
                     "timestamp": entry.get("timestamp"),
                     "priority": entry.get("priority"),
-                    "status": entry.get("status")
-                    or ("needs_review" if entry.get("needs_review") else "pending"),
                     "outcome_alignment": entry.get("outcome_alignment"),
                     "follow_up_need": entry.get("follow_up_need"),
                     "raw": entry,
@@ -1005,14 +779,15 @@ def main() -> None:
     )
 
     status_counts: Dict[str, int] = {}
+    status_by_request: Dict[str, str] = {}
     for record in rows_all:
         rid = str(record.get("request_id"))
         labels = labels_by_request.get(rid, [])
-        status = request_status(labels)
+        status = request_status(labels, REQUIRED_UNIQUE_FOR_COMPLETION)
+        status_by_request[rid] = status
         status_counts[status] = status_counts.get(status, 0) + 1
     with_images = sum(1 for r in rows_all if r.get("has_photo"))
     with_notes = sum(1 for r in rows_all if r.get("status_notes"))
-    with_resolution_notes = sum(1 for r in rows_all if r.get("resolution_notes"))
 
     if BACKUP_SETTING is None:
         enable_file_backup = False
@@ -1022,12 +797,11 @@ def main() -> None:
     st.sidebar.header("Queue filters")
     with st.sidebar.expander("Queue snapshot", expanded=False):
         st.write(f"Total requests: {len(rows_all)}")
-        for key in ["unlabeled", "needs_review", "conflict", "labeled"]:
+        for key in ["unlabeled", "needs_review", "labeled"]:
             st.write(f"{key.replace('_', ' ').title()}: {status_counts.get(key, 0)}")
         st.write("—")
         st.write(f"With photos: {with_images}")
         st.write(f"With status notes: {with_notes}")
-        st.write(f"With resolution notes: {with_resolution_notes}")
 
     with st.sidebar.expander("My recent labels", expanded=False):
         if my_labels:
@@ -1062,7 +836,7 @@ def main() -> None:
                 label_prefill = entry.get("raw") or {}
                 st.session_state["prefill"] = deepcopy(label_prefill)
                 st.session_state["queue_search"] = str(entry["request_id"])
-                st.session_state["jump_target"] = str(entry["request_id"])
+                st.session_state["current_request_id"] = str(entry["request_id"])
                 st.session_state["status_filter"] = "all"
                 st.session_state.pop("undo_context", None)
                 st.session_state["reset"] = True
@@ -1113,8 +887,7 @@ def main() -> None:
         help="When enabled, the queue will only include requests that already have photos or 311 responder notes.",
     )
     sort_options = [
-        "Rich context first",
-        "Random",
+        "Recommended order",
         "Oldest first",
         "Newest first",
         "Request ID",
@@ -1123,9 +896,8 @@ def main() -> None:
         "Sort order",
         sort_options,
         index=0,
-        help="Rich context surfaces requests that already have photos, closure notes, or metadata so annotators can move quickly on well-documented cases.",
+        help="Recommended order prioritizes items needing review, then unlabeled requests with photos, while keeping a consistent per-user shuffle.",
     )
-    seed = st.sidebar.number_input("Random seed", value=42, step=1)
     if st.sidebar.button("Reset queue"):
         st.session_state["reset"] = True
 
@@ -1145,15 +917,24 @@ def main() -> None:
         only_mine=only_mine,
         require_rich_context=require_rich_context,
     )
-    if sort_mode == "Rich context first":
-        rows.sort(
-            key=lambda r: (
-                -rich_context_score(r),
-                parse_created_at(r.get("created_at")) or datetime.max,
-            )
-        )
-    elif sort_mode == "Random":
-        random.Random(seed).shuffle(rows)
+    if sort_mode == "Recommended order":
+        status_priority = {
+            "needs_review": 0,
+            "unlabeled": 1,
+            "labeled": 2,
+        }
+
+        def recommended_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
+            rid = str(record.get("request_id"))
+            status = status_by_request.get(rid, "labeled")
+            status_score = status_priority.get(status, 4)
+            photo_score = 0 if record.get("has_photo") else 1
+            context_score = -rich_context_score(record)
+            recency_score = parse_created_at(record.get("created_at")) or datetime.max
+            user_random = user_random_value(rid, annotator_uid)
+            return (status_score, photo_score, context_score, recency_score, user_random)
+
+        rows.sort(key=recommended_key)
     elif sort_mode == "Oldest first":
         rows.sort(key=lambda r: parse_created_at(r.get("created_at")) or datetime.max)
     elif sort_mode == "Newest first":
@@ -1164,42 +945,59 @@ def main() -> None:
     elif sort_mode == "Request ID":
         rows.sort(key=lambda r: str(r.get("request_id") or ""))
 
-    jump_target = st.session_state.pop("jump_target", None)
-    jumped = False
-    if jump_target:
-        jump_target = str(jump_target)
-        for idx_candidate, candidate in enumerate(rows):
-            if str(candidate.get("request_id")) == jump_target:
-                st.session_state.idx = idx_candidate
-                jumped = True
-                break
-
-    if "idx" not in st.session_state or (st.session_state.get("reset") and not jumped):
-        st.session_state.idx = 0
-        st.session_state["reset"] = False
-    elif st.session_state.get("reset"):
-        st.session_state["reset"] = False
-
     if not rows:
         st.warning("No items matching the filters. Adjust the sidebar.")
         st.stop()
 
-    idx = st.session_state.idx
-    idx = max(0, min(idx, len(rows) - 1))
-    record = rows[idx]
-    req_id = str(record.get("request_id"))
+    request_ids: List[str] = []
+    rows_by_id: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        rid = str(row.get("request_id"))
+        request_ids.append(rid)
+        rows_by_id[rid] = row
+
+    queue_order: List[str] = st.session_state.get("queue_order", [])
+    queue_order = [rid for rid in queue_order if rid in rows_by_id]
+
+    for rid in request_ids:
+        if rid not in queue_order:
+            queue_order.append(rid)
+
+    if not queue_order or st.session_state.get("reset"):
+        queue_order = request_ids.copy()
+
+    st.session_state["queue_order"] = queue_order
+    st.session_state["reset"] = False
+
+    current_id = st.session_state.get("current_request_id")
+    if current_id not in queue_order:
+        current_id = queue_order[0]
+        st.session_state["current_request_id"] = current_id
+
+    idx = queue_order.index(current_id)
+    st.session_state.idx = idx
+
+    record = rows_by_id[current_id]
+    req_id = current_id
     existing_labels = sort_labels(labels_by_request.get(req_id, []))
-    current_status = request_status(existing_labels)
+    latest_other_label = latest_label_excluding(existing_labels, annotator_uid)
+    review_mode = latest_other_label is not None
+    current_status = request_status(
+        existing_labels, REQUIRED_UNIQUE_FOR_COMPLETION
+    )
+
+    def widget_key(name: str) -> str:
+        return f"{req_id}_{name}"
 
     prev_clicked = False
     save_clicked = False
     skip_clicked = False
 
-    summary_col, action_col = st.columns([3, 1.6])
+    summary_col, action_col = st.columns([5, 2], gap="small")
     with summary_col:
         st.caption(
-            f"Queue {len(rows)} · Labeled {len([r for r in labels_by_request if labels_by_request[r]])} · "
-            f"Index {idx + 1}/{len(rows)} · Time to resolution {format_duration_hours(record.get('hours_to_resolution'))}"
+            f"Queue {len(queue_order)} · Labeled {len([r for r in labels_by_request if labels_by_request[r]])} · "
+            f"Index {idx + 1}/{len(queue_order)} · Time to resolution {format_duration_hours(record.get('hours_to_resolution'))}"
         )
         st.markdown(
             f"**Case snapshot:** {status_badge(record)} · {outcome_highlight(record)}"
@@ -1238,7 +1036,7 @@ def main() -> None:
 
     images = resolve_images(record)
 
-    left, right = st.columns([3, 2])
+    left, right = st.columns([5, 4], gap="medium")
     with left:
         st.subheader(f"Request {req_id or '—'}")
         st.caption(
@@ -1271,22 +1069,138 @@ def main() -> None:
         if not images:
             st.info("No images for this report.")
         else:
-            cols = st.columns(min(3, len(images)))
-            for i, info in enumerate(images[:9]):
-                source = info["local_path"] or info["url"]
-                caption_parts = []
-                if info["local_path"]:
-                    caption_parts.append("cached")
-                if info["status"] and info["status"] != "ok":
-                    caption_parts.append(info["status"])
-                caption = " | ".join(caption_parts) if caption_parts else None
-                with cols[i % len(cols)]:
-                    st.image(source, use_container_width=True, caption=caption)
-            if len(images) > 9:
-                st.info(f"Showing first 9 images ({len(images)} total)")
+            image_index_state_key = widget_key("image_index")
+            num_images = len(images)
+            stored_index = st.session_state.get(image_index_state_key, 0)
+            if stored_index >= num_images:
+                stored_index = 0
+                st.session_state[image_index_state_key] = stored_index
+
+            if num_images > 1:
+                captions: List[str] = []
+                for idx, info in enumerate(images):
+                    details: List[str] = []
+                    if info.get("status") and info.get("status") != "ok":
+                        details.append(str(info.get("status")))
+                    label = f"Photo {idx + 1} of {num_images}"
+                    if details:
+                        label = f"{label} ({'; '.join(details)})"
+                    captions.append(label)
+
+                st.caption(
+                    "Review each photo using the buttons or dropdown below. The selected image fills the panel."
+                )
+
+                nav_cols = st.columns([1, 3, 1])
+                with nav_cols[0]:
+                    if st.button(
+                        "◀ Previous photo",
+                        key=widget_key("image_prev"),
+                        help="Show the previous photo",
+                    ):
+                        st.session_state[image_index_state_key] = (stored_index - 1) % num_images
+                        st.rerun()
+
+                with nav_cols[1]:
+                    selected_index = st.selectbox(
+                        "Photo selector",
+                        options=list(range(num_images)),
+                        index=stored_index,
+                        format_func=lambda i: captions[i],
+                        key=widget_key("image_select"),
+                    )
+                    if selected_index != stored_index:
+                        st.session_state[image_index_state_key] = selected_index
+                        stored_index = selected_index
+
+                with nav_cols[2]:
+                    if st.button(
+                        "Next photo ▶",
+                        key=widget_key("image_next"),
+                        help="Show the next photo",
+                    ):
+                        st.session_state[image_index_state_key] = (stored_index + 1) % num_images
+                        st.rerun()
+
+                current_index = st.session_state.get(image_index_state_key, 0)
+                current_index = max(0, min(current_index, num_images - 1))
+            else:
+                st.caption("Single photo provided for this request.")
+                current_index = 0
+                st.session_state[image_index_state_key] = 0
+            current_info = images[current_index]
+            image_source = current_info.get("local_path") or current_info.get("url")
+            image_caption_parts: List[str] = []
+            if current_info.get("status") and current_info.get("status") != "ok":
+                image_caption_parts.append(str(current_info.get("status")))
+            if current_info.get("local_path"):
+                image_caption_parts.append("Cached locally")
+            image_caption_parts.append(f"Viewing photo {current_index + 1} of {num_images}")
+            if image_source:
+                st.image(image_source, use_container_width=True)
+            else:
+                st.warning("This photo could not be loaded.")
+            st.caption(" · ".join(image_caption_parts))
 
     with right:
-        st.markdown("#### Decision")
+        if review_mode and latest_other_label:
+            reviewer_banner = st.container()
+            with reviewer_banner:
+                st.warning(
+                    "Review mode: confirm or adjust the prior submission. Log disagreements and add reviewer notes.",
+                    icon="📝",
+                )
+                prev_features = coerce_features(latest_other_label)
+                prev_summary_rows = [
+                    (
+                        "Previous review",
+                        REVIEW_STATUS_LABELS.get(
+                            latest_other_label.get("review_status") or "pending",
+                            REVIEW_STATUS_LABELS["pending"],
+                        ),
+                    ),
+                    (
+                        "Previous annotator",
+                        latest_other_label.get("annotator_display")
+                        or latest_other_label.get("annotator")
+                        or "—",
+                    ),
+                    (
+                        "Saved at",
+                        format_timestamp(latest_other_label.get("timestamp")),
+                    ),
+                    (
+                        "Priority",
+                        (latest_other_label.get("priority") or "—").title(),
+                    ),
+                    (
+                        "GOA expectation",
+                        goa_window_label(resolve_goa_window(prev_features)),
+                    ),
+                    (
+                        "Tents count",
+                        (
+                            prev_features.get("tents_count")
+                            if prev_features.get("tents_count") is not None
+                            else "—"
+                        ),
+                    ),
+                    (
+                        "Routing dept.",
+                        prev_features.get("routing_department") or "—",
+                    ),
+                ]
+                prev_df = pd.DataFrame(
+                    prev_summary_rows, columns=["Field", "Previous value"]
+                )
+                st.dataframe(prev_df, use_container_width=True, hide_index=True)
+                if latest_other_label.get("notes"):
+                    st.caption("Previous notes")
+                    st.write(latest_other_label["notes"])
+                if latest_other_label.get("review_notes"):
+                    st.caption("Previous reviewer notes")
+                    st.write(latest_other_label["review_notes"])
+
         glossary_pairs = list(FIELD_GLOSSARY.items())
         if hasattr(st, "popover"):
             with st.popover("ℹ️ Field glossary"):
@@ -1308,13 +1222,28 @@ def main() -> None:
             reset_note_state()
             st.rerun()
 
-        prefill = st.session_state.pop("prefill", latest_for_user)
+        prefill_candidate = st.session_state.pop("prefill", latest_for_user)
+        if prefill_candidate is None and review_mode and latest_other_label:
+            prefill_candidate = latest_other_label
+        prefill = prefill_candidate
         prefill_features = coerce_features(prefill) if prefill else {}
         record_defaults = record_feature_defaults(record)
         initial_features = {**record_defaults, **prefill_features}
 
-        def widget_key(name: str) -> str:
-            return f"{req_id}_{name}"
+        prefill_from_self = False
+        if prefill:
+            uid_match = str(prefill.get("annotator_uid")) == annotator_uid
+            email_match = bool(
+                raw_email
+                and (prefill.get("annotator_email") or "").lower() == user_email
+            )
+            prefill_from_self = uid_match or email_match
+
+        if "tents_count" not in initial_features:
+            legacy_tents = prefill_features.get("tents_present")
+            if isinstance(legacy_tents, bool):
+                initial_features["tents_count"] = 1 if legacy_tents else 0
+        initial_features.pop("tents_present", None)
 
         def prefill_bool(key: str) -> bool:
             return bool(initial_features.get(key, False))
@@ -1361,103 +1290,153 @@ def main() -> None:
         )
         priority_index = PRIORITY_OPTIONS.index(priority_label_default)
 
-        routing_cols = st.columns([2.2, 1.2])
-        with routing_cols[0]:
-            priority_label = st.radio(
-                "Priority",
-                PRIORITY_OPTIONS,
-                horizontal=True,
-                index=priority_index,
-                help=LABEL_TIPS["priority"],
-                key=widget_key("priority"),
-            )
+        review_status_default = "pending"
+        if (
+            prefill_from_self
+            and prefill
+            and (prefill.get("review_status") in REVIEW_STATUS_LABELS)
+        ):
+            review_status_default = prefill["review_status"]
+        elif review_mode:
+            review_status_default = "agree"
 
-            routing_default = initial_features.get("routing_department", "SFHOT")
-            if routing_default not in ROUTING_DEPARTMENTS:
-                routing_default = "SFHOT"
-            routing_department = st.selectbox(
-                "Routing department",
-                ROUTING_DEPARTMENTS,
-                index=ROUTING_DEPARTMENTS.index(routing_default),
-                help=LABEL_TIPS["routing_department"],
-                key=widget_key("routing_department"),
-            )
+        if prefill_from_self and prefill:
+            review_notes_default = prefill.get("review_notes") or ""
+        else:
+            review_notes_default = ""
 
-            routing_other_default = str(initial_features.get("routing_other") or "")
-            routing_other = ""
-            if routing_department == "Other":
-                routing_other = st.text_input(
-                    "Describe routing",
-                    value=routing_other_default,
-                    key=widget_key("routing_other"),
-                )
+        st.markdown("### 1. Priority & review")
+        priority_label = st.radio(
+            "Priority",
+            PRIORITY_OPTIONS,
+            horizontal=True,
+            index=priority_index,
+            help=LABEL_TIPS["priority"],
+            key=widget_key("priority"),
+        )
+        goa_values = [value for value, _ in GOA_WINDOW_OPTIONS]
+        goa_labels = [label for _, label in GOA_WINDOW_OPTIONS]
+        goa_default = resolve_goa_window(initial_features)
+        goa_default_index = (
+            goa_values.index(goa_default) if goa_default in goa_values else 0
+        )
+        goa_selected_label = st.selectbox(
+            "GOA expectation",
+            goa_labels,
+            index=goa_default_index,
+            help=LABEL_TIPS["goa_window"],
+            key=widget_key("goa_window"),
+        )
+        goa_window_value = goa_values[goa_labels.index(goa_selected_label)]
 
-            secondary_default = [
-                option
-                for option in prefill_list("routing_secondary")
-                if option in SECONDARY_TEAM_OPTIONS
-            ]
-            secondary_teams = st.multiselect(
-                "Also flag",
-                SECONDARY_TEAM_OPTIONS,
-                default=secondary_default,
-                help=LABEL_TIPS["routing_secondary"],
-                key=widget_key("routing_secondary"),
+        if review_mode:
+            review_status = st.radio(
+                "Review decision",
+                ["agree", "disagree"],
+                index=["agree", "disagree"].index(
+                    review_status_default
+                    if review_status_default in ["agree", "disagree"]
+                    else "agree"
+                ),
+                help=LABEL_TIPS["review_status"],
+                key=widget_key("review_status"),
             )
-
-            partner_default = [
-                option
-                for option in prefill_list("routing_partners")
-                if option in ROUTING_PARTNER_OPTIONS
-            ]
-            routing_partners = st.multiselect(
-                "Closure handled by",
-                ROUTING_PARTNER_OPTIONS,
-                default=partner_default,
-                help=LABEL_TIPS["routing_partners"],
-                key=widget_key("routing_partners"),
-            )
-
-        with routing_cols[1]:
-            likely_goa = st.checkbox(
-                "Likely GOA",
-                value=bool(initial_features.get("likely_goa")),
-                help=LABEL_TIPS["likely_goa"],
-                key=widget_key("likely_goa"),
-            )
-
-            urgency_default = initial_features.get("urgency_tag", "Unclear")
-            if isinstance(urgency_default, str):
-                urgency_default = urgency_default.title()
-            if urgency_default not in URGENCY_OPTIONS:
-                urgency_default = "Unclear"
-            urgency_label = st.radio(
-                "Urgency tag",
-                URGENCY_OPTIONS,
-                index=URGENCY_OPTIONS.index(urgency_default),
-                help=LABEL_TIPS["urgency_tag"],
-                key=widget_key("urgency_tag"),
-            )
-
-            team_handoff = st.checkbox(
-                "Team handoff",
-                value=bool(initial_features.get("team_handoff")),
-                help=LABEL_TIPS["team_handoff"],
-                key=widget_key("team_handoff"),
-            )
-
-            reroute_count = st.number_input(
-                "Times rerouted",
-                min_value=0,
-                step=1,
-                value=prefill_int("reroute_count", 0),
-                key=widget_key("reroute_count"),
-            )
+        else:
+            review_status = "pending"
 
         priority_value = PRIORITY_STORAGE[priority_label]
-        urgency_value = urgency_label.lower().replace(" ", "_")
 
-        notes_val = (prefill.get("notes") if prefill else "") or ""
+        st.markdown("### 2. Routing")
+        routing_default = initial_features.get("routing_department") or "Unknown"
+        if routing_default not in ROUTING_DEPARTMENTS:
+            routing_default = "Unknown"
+        routing_department = st.selectbox(
+            "Routing department",
+            ROUTING_DEPARTMENTS,
+            index=ROUTING_DEPARTMENTS.index(routing_default),
+            help=LABEL_TIPS["routing_department"],
+            key=widget_key("routing_department"),
+        )
+        routing_other_default = str(initial_features.get("routing_other") or "")
+        routing_other = ""
+        if routing_department == "Other":
+            routing_other = st.text_input(
+                "Describe routing",
+                value=routing_other_default,
+                key=widget_key("routing_other"),
+            )
+
+        st.markdown("### 3. On-scene observations")
+        feature_options = [
+            ("lying_face_down", FEATURE_DISPLAY_NAMES["lying_face_down"]),
+            ("safety_issue", FEATURE_DISPLAY_NAMES["safety_issue"]),
+            ("drugs", FEATURE_DISPLAY_NAMES["drugs"]),
+            ("blocking", FEATURE_DISPLAY_NAMES["blocking"]),
+            ("on_ramp", FEATURE_DISPLAY_NAMES["on_ramp"]),
+            ("propane_or_flame", FEATURE_DISPLAY_NAMES["propane_or_flame"]),
+            ("children_present", FEATURE_DISPLAY_NAMES["children_present"]),
+            ("wheelchair", FEATURE_DISPLAY_NAMES["wheelchair"]),
+        ]
+        default_feature_labels = [
+            label for key, label in feature_options if prefill_bool(key)
+        ]
+        selected_feature_labels = st.multiselect(
+            "Observed conditions",
+            [label for _, label in feature_options],
+            default=default_feature_labels,
+            help="Select all observed conditions that apply.",
+            key=widget_key("observed_features"),
+        )
+        selected_feature_keys = {
+            key for key, label in feature_options if label in selected_feature_labels
+        }
+
+        metrics_cols = st.columns([1, 1, 1])
+        with metrics_cols[0]:
+            tents_count = st.number_input(
+                FEATURE_DISPLAY_NAMES["tents_count"],
+                min_value=0,
+                max_value=50,
+                step=1,
+                value=prefill_int("tents_count", 0),
+                help=FEATURE_TIPS["tents_count"],
+                key=widget_key("feature_tents_count"),
+            )
+        with metrics_cols[1]:
+            num_people_opts = ["0", "1", "2-3", "4-5", "6+"]
+            num_people_bin = st.selectbox(
+                FEATURE_DISPLAY_NAMES["num_people_bin"],
+                num_people_opts,
+                index=prefill_select("num_people_bin", "1", num_people_opts),
+                help=FEATURE_TIPS["num_people_bin"],
+                key=widget_key("num_people_bin"),
+            )
+        with metrics_cols[2]:
+            size_opts = ["0", "1-20", "21-80", "81-150", "150+"]
+            size_feet_bin = st.selectbox(
+                FEATURE_DISPLAY_NAMES["size_feet_bin"],
+                size_opts,
+                index=prefill_select("size_feet_bin", "21-80", size_opts),
+                help=FEATURE_TIPS["size_feet_bin"],
+                key=widget_key("size_feet_bin"),
+            )
+
+        feature_flags = {
+            key: key in selected_feature_keys for key, _ in feature_options
+        }
+        lying = feature_flags["lying_face_down"]
+        safety = feature_flags["safety_issue"]
+        drugs = feature_flags["drugs"]
+        blocking = feature_flags["blocking"]
+        onramp = feature_flags["on_ramp"]
+        propane = feature_flags["propane_or_flame"]
+        kids = feature_flags["children_present"]
+        chair = feature_flags["wheelchair"]
+
+        st.markdown("### 4. Notes & evidence")
+        notes_val = (
+            prefill.get("notes") if prefill_from_self and prefill else ""
+        ) or ""
         if st.session_state.get(NOTE_REQ_KEY) != req_id:
             st.session_state[NOTE_REQ_KEY] = req_id
             st.session_state[NOTE_STATE_KEY] = str(notes_val)
@@ -1468,95 +1447,16 @@ def main() -> None:
             help=LABEL_TIPS["notes"],
         )
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            lying = st.checkbox(
-                FEATURE_DISPLAY_NAMES["lying_face_down"],
-                value=prefill_bool("lying_face_down"),
-                help=FEATURE_TIPS["lying_face_down"],
-                key=widget_key("feature_lying_face_down"),
+        if review_mode:
+            review_notes = st.text_area(
+                "Reviewer notes",
+                value=review_notes_default,
+                height=110,
+                help=LABEL_TIPS["review_notes"],
+                key=widget_key("review_notes"),
             )
-            safety = st.checkbox(
-                FEATURE_DISPLAY_NAMES["safety_issue"],
-                value=prefill_bool("safety_issue"),
-                help=FEATURE_TIPS["safety_issue"],
-                key=widget_key("feature_safety_issue"),
-            )
-            drugs = st.checkbox(
-                FEATURE_DISPLAY_NAMES["drugs"],
-                value=prefill_bool("drugs"),
-                help=FEATURE_TIPS["drugs"],
-                key=widget_key("feature_drugs"),
-            )
-        with c2:
-            tents = st.checkbox(
-                FEATURE_DISPLAY_NAMES["tents_present"],
-                value=prefill_bool("tents_present"),
-                help=FEATURE_TIPS["tents_present"],
-                key=widget_key("feature_tents_present"),
-            )
-            blocking = st.checkbox(
-                FEATURE_DISPLAY_NAMES["blocking"],
-                value=prefill_bool("blocking"),
-                help=FEATURE_TIPS["blocking"],
-                key=widget_key("feature_blocking"),
-            )
-            onramp = st.checkbox(
-                FEATURE_DISPLAY_NAMES["on_ramp"],
-                value=prefill_bool("on_ramp"),
-                help=FEATURE_TIPS["on_ramp"],
-                key=widget_key("feature_on_ramp"),
-            )
-        with c3:
-            propane = st.checkbox(
-                FEATURE_DISPLAY_NAMES["propane_or_flame"],
-                value=prefill_bool("propane_or_flame"),
-                help=FEATURE_TIPS["propane_or_flame"],
-                key=widget_key("feature_propane_or_flame"),
-            )
-            kids = st.checkbox(
-                FEATURE_DISPLAY_NAMES["children_present"],
-                value=prefill_bool("children_present"),
-                help=FEATURE_TIPS["children_present"],
-                key=widget_key("feature_children_present"),
-            )
-            chair = st.checkbox(
-                FEATURE_DISPLAY_NAMES["wheelchair"],
-                value=prefill_bool("wheelchair"),
-                help=FEATURE_TIPS["wheelchair"],
-                key=widget_key("feature_wheelchair"),
-            )
-
-        num_people_opts = ["0", "1", "2-3", "4-5", "6+"]
-        num_people_bin = st.selectbox(
-            FEATURE_DISPLAY_NAMES["num_people_bin"],
-            num_people_opts,
-            index=prefill_select("num_people_bin", "1", num_people_opts),
-            help=FEATURE_TIPS["num_people_bin"],
-            key=widget_key("num_people_bin"),
-        )
-        size_opts = ["0", "1-20", "21-80", "81-150", "150+"]
-        size_feet_bin = st.selectbox(
-            FEATURE_DISPLAY_NAMES["size_feet_bin"],
-            size_opts,
-            index=prefill_select("size_feet_bin", "21-80", size_opts),
-            help=FEATURE_TIPS["size_feet_bin"],
-            key=widget_key("size_feet_bin"),
-        )
-
-        confidence_opts = ["High", "Medium", "Low"]
-        confidence_default = (
-            prefill.get("confidence")
-            if prefill and prefill.get("confidence") in confidence_opts
-            else "Medium"
-        )
-        confidence = st.selectbox(
-            "Confidence",
-            confidence_opts,
-            index=confidence_opts.index(confidence_default),
-            help=LABEL_TIPS["confidence"],
-            key=widget_key("confidence"),
-        )
+        else:
+            review_notes = ""
 
         info_source_options = [
             "Photos",
@@ -1626,106 +1526,124 @@ def main() -> None:
             for label in follow_up_selected_labels
         ]
 
-        abstain = st.checkbox(
-            "Abstain (not sure)",
-            value=bool(prefill.get("abstain")) if prefill else False,
-            help=LABEL_TIPS["abstain"],
-            key=widget_key("abstain"),
-        )
-        needs_review = st.checkbox(
-            "Flag for review",
-            value=bool(prefill.get("needs_review")) if prefill else False,
-            help=LABEL_TIPS["needs_review"],
-            key=widget_key("needs_review"),
-        )
-        label_status = st.selectbox(
-            "Label status",
-            ["pending", "resolved"],
-            index=0 if not prefill or prefill.get("status") != "resolved" else 1,
-            help=LABEL_TIPS["label_status"],
-            key=widget_key("label_status"),
-        )
-
         st.divider()
         st.markdown("#### Context & History")
-        keywords = [
-            k.replace("kw_", "")
-            for k in record.keys()
-            if k.startswith("kw_") and record[k]
-        ]
         summary_tab, history_tab, raw_tab = st.tabs(
             ["Summary", "Annotation history", "Raw data"]
         )
 
         with summary_tab:
             latest_any = existing_labels[-1] if existing_labels else None
-            summary_rows = [
-                ("Created", format_timestamp(record.get("created_at"))),
-                ("Updated", format_timestamp(record.get("updated_at"))),
-                ("District", record.get("police_district") or "—"),
-                (
-                    "Neighborhood",
-                    record.get("neighborhoods_sffind_boundaries") or "—",
-                ),
-                ("Service subtype", record.get("service_subtype") or "—"),
-                (
-                    ("Location", f"{record.get('lat')}, {record.get('lon')}")
-                    if record.get("lat") and record.get("lon")
-                    else ("Location", "—")
-                ),
-                ("Keywords", ", ".join(keywords) or "—"),
+            summary_rows: List[Tuple[str, str]] = []
+            keywords = [
+                k.replace("kw_", "").replace("_", " ")
+                for k in record.keys()
+                if k.startswith("kw_") and record[k]
             ]
+            review_display = REVIEW_STATUS_LABELS.get(
+                review_status, REVIEW_STATUS_LABELS["pending"]
+            )
+            summary_rows.append(("Review decision", review_display))
+            if review_notes and isinstance(review_notes, str) and review_notes.strip():
+                summary_rows.append(("Reviewer notes", review_notes.strip()))
+            if review_mode and latest_other_label:
+                prev_features = coerce_features(latest_other_label)
+                prev_goa_value = resolve_goa_window(prev_features)
+                summary_rows.extend(
+                    [
+                        (
+                            "Previous priority",
+                            latest_other_label.get("priority") or "—",
+                        ),
+                        (
+                            "Prev. GOA expectation",
+                            goa_window_label(prev_goa_value),
+                        ),
+                        (
+                            "Prev. tents count",
+                            (
+                                prev_features.get("tents_count")
+                                if prev_features.get("tents_count") is not None
+                                else "—"
+                            ),
+                        ),
+                    ]
+                )
+
+            summary_rows.extend(
+                [
+                    (
+                        "Routing department",
+                        (
+                            routing_department
+                            if routing_department != "Other"
+                            else f"Other ({routing_other or 'unspecified'})"
+                        ),
+                    ),
+                    (
+                        "GOA expectation",
+                        goa_window_label(goa_window_value),
+                    ),
+                    (
+                        "Observed conditions",
+                        ", ".join(selected_feature_labels) or "—",
+                    ),
+                        ("# of tents", str(tents_count)),
+                        ("Est. # of people", num_people_bin),
+                        ("Est. footprint (feet)", size_feet_bin),
+                    ]
+                )
+
             if latest_any:
-                summary_rows.insert(
-                    1,
-                    (
-                        "Outcome alignment",
-                        outcome_display(latest_any.get("outcome_alignment")),
-                    ),
+                latest_any_features = coerce_features(latest_any)
+                latest_any_goa = resolve_goa_window(latest_any_features)
+                latest_observed = [
+                    FEATURE_DISPLAY_NAMES.get(key, key.replace("_", " ").title())
+                    for key, value in (latest_any_features or {}).items()
+                    if isinstance(value, bool) and value
+                    and key in FEATURE_DISPLAY_NAMES
+                ]
+                summary_rows.extend(
+                    [
+                        (
+                            "Latest GOA expectation",
+                            goa_window_label(latest_any_goa),
+                        ),
+                        (
+                            "Latest observed",
+                            ", ".join(latest_observed) or "—",
+                        ),
+                        (
+                            "Outcome alignment",
+                            outcome_display(latest_any.get("outcome_alignment")),
+                        ),
+                        (
+                            "Follow-up needs",
+                            follow_up_display(latest_any.get("follow_up_need")),
+                        ),
+                    ]
                 )
-                summary_rows.insert(
-                    2,
+
+            summary_rows.extend(
+                [
+                    ("Created", format_timestamp(record.get("created_at"))),
+                    ("Updated", format_timestamp(record.get("updated_at"))),
+                    ("District", record.get("police_district") or "—"),
                     (
-                        "Follow-up needs",
-                        follow_up_display(latest_any.get("follow_up_need")),
+                        "Neighborhood",
+                        record.get("neighborhoods_sffind_boundaries") or "—",
                     ),
-                )
-            summary_rows.insert(
-                1,
-                (
-                    "Routing department",
+                    ("Service subtype", record.get("service_subtype") or "—"),
                     (
-                        routing_department
-                        if routing_department != "Other"
-                        else f"Other ({routing_other or 'unspecified'})"
+                        "Location",
+                        (
+                            f"{record.get('lat')}, {record.get('lon')}"
+                            if record.get("lat") and record.get("lon")
+                            else "—"
+                        ),
                     ),
-                ),
-            )
-            summary_rows.insert(
-                2,
-                (
-                    "Secondary teams",
-                    ", ".join(secondary_teams) if secondary_teams else "—",
-                ),
-            )
-            summary_rows.insert(
-                3,
-                (
-                    "Routing partners",
-                    ", ".join(routing_partners) if routing_partners else "—",
-                ),
-            )
-            summary_rows.insert(
-                4,
-                ("Team handoff", "Yes" if team_handoff else "No"),
-            )
-            summary_rows.insert(
-                5,
-                ("Likely GOA", "Yes" if likely_goa else "No"),
-            )
-            summary_rows.insert(
-                6,
-                ("Urgency tag", urgency_label),
+                    ("Keywords", ", ".join(keywords) or "—"),
+                ]
             )
             summary_df = pd.DataFrame(summary_rows, columns=["Attribute", "Value"])
             st.dataframe(summary_df, use_container_width=True, hide_index=True)
@@ -1754,38 +1672,40 @@ def main() -> None:
                             or entry.get("annotator")
                             or entry.get("annotator_uid")
                             or "—",
-                            "priority": entry.get("priority")
-                            or entry.get("labels", {}).get("priority"),
-                            "confidence": entry.get("confidence") or "",
-                            "evidence": ", ".join(entry.get("evidence_sources") or []),
-                            "urgency": str(
-                                (entry.get("features") or {}).get("urgency_tag") or ""
-                            )
-                            .replace("_", " ")
-                            .title()
-                            or "—",
-                            "likely_goa": (
-                                "Yes"
-                                if (entry.get("features") or {}).get("likely_goa")
-                                else "No"
-                            ),
                             "routing": (entry.get("features") or {}).get(
                                 "routing_department"
                             )
                             or "—",
-                            "status": entry.get("status")
-                            or (
-                                "needs_review"
-                                if entry.get("needs_review")
-                                else "pending"
+                            "tents": (
+                                str((entry.get("features") or {}).get("tents_count"))
+                                if (entry.get("features") or {}).get("tents_count")
+                                is not None
+                                else "—"
                             ),
-                            "outcome": outcome_display(entry.get("outcome_alignment")),
+                            "observed": ", ".join(
+                                [
+                                    FEATURE_DISPLAY_NAMES.get(key, key.replace("_", " ").title())
+                                    for key, value in ((entry.get("features") or {})).items()
+                                    if isinstance(value, bool)
+                                    and value
+                                    and key in FEATURE_DISPLAY_NAMES
+                                ]
+                            )
+                            or "—",
                             "follow_up": follow_up_display(entry.get("follow_up_need")),
+                            "outcome": outcome_display(entry.get("outcome_alignment")),
+                            "evidence": ", ".join(entry.get("evidence_sources") or []),
                             "notes": entry.get("notes") or "",
+                            "review_decision": REVIEW_STATUS_LABELS.get(
+                                entry.get("review_status") or "pending",
+                                REVIEW_STATUS_LABELS["pending"],
+                            ),
+                            "review_notes": entry.get("review_notes") or "",
                         }
                         for entry in existing_labels
                     ]
                 )
+
                 st.dataframe(history_df, use_container_width=True, hide_index=True)
             else:
                 st.info("No labels yet")
@@ -1829,10 +1749,25 @@ def main() -> None:
             skip_clicked = True
 
     if prev_clicked:
-        st.session_state.idx = max(idx - 1, 0)
+        target_idx = max(idx - 1, 0)
+        st.session_state.idx = target_idx
+        st.session_state["current_request_id"] = queue_order[target_idx]
         reset_note_state()
         st.rerun()
     elif save_clicked:
+        if review_mode:
+            if review_status not in ["agree", "disagree"]:
+                st.error(
+                    "Select whether you agree or disagree with the previous label.",
+                    icon="⚠️",
+                )
+                st.stop()
+            if not review_notes or not review_notes.strip():
+                st.error(
+                    "Reviewer notes are required when you approve or change a prior label.",
+                    icon="⚠️",
+                )
+                st.stop()
         label_id = str(uuid.uuid4())
         payload = {
             "label_id": label_id,
@@ -1840,6 +1775,7 @@ def main() -> None:
             "annotator_uid": annotator_uid,
             "annotator": annotator_display,
             "annotator_display": annotator_display,
+            "annotator_email": raw_email or None,
             "role": annotator_role,
             "timestamp": datetime.utcnow().isoformat(),
             "priority": priority_value,
@@ -1847,7 +1783,6 @@ def main() -> None:
                 "lying_face_down": lying,
                 "safety_issue": safety,
                 "drugs": drugs,
-                "tents_present": tents,
                 "blocking": blocking,
                 "on_ramp": onramp,
                 "propane_or_flame": propane,
@@ -1855,26 +1790,24 @@ def main() -> None:
                 "wheelchair": chair,
                 "num_people_bin": num_people_bin,
                 "size_feet_bin": size_feet_bin,
-                "likely_goa": bool(likely_goa),
-                "urgency_tag": urgency_value,
+                "tents_count": int(tents_count),
+                "goa_window": goa_window_value,
                 "routing_department": routing_department,
                 "routing_other": routing_other.strip() or None,
-                "routing_secondary": secondary_teams,
-                "routing_partners": routing_partners,
-                "team_handoff": bool(team_handoff),
-                "reroute_count": int(reroute_count),
             },
-            "abstain": bool(abstain),
-            "needs_review": bool(needs_review),
-            "status": label_status,
             "notes": notes.strip() or None,
-            "confidence": confidence,
             "evidence_sources": info_sources,
             "outcome_alignment": outcome_alignment,
             "follow_up_need": follow_up_need,
             "image_paths": record.get("image_paths"),
             "image_checksums": record.get("image_checksums"),
             "revision_of": prefill.get("label_id") if prefill else None,
+            "review_status": review_status,
+            "review_notes": (
+                review_notes.strip()
+                if isinstance(review_notes, str) and review_notes.strip()
+                else None
+            ),
         }
         if save_label(payload, supabase_client, enable_file_backup):
             st.session_state["undo_context"] = {
@@ -1884,11 +1817,22 @@ def main() -> None:
                 "previous_prefill": deepcopy(prefill) if prefill else None,
                 "timestamp": datetime.utcnow().isoformat(),
             }
-        st.session_state.idx = min(idx + 1, len(rows) - 1)
-        reset_note_state()
-        st.rerun()
+            current_pos = queue_order.index(req_id)
+            next_idx = current_pos + 1 if current_pos + 1 < len(queue_order) else current_pos
+            st.session_state.idx = next_idx
+            st.session_state["current_request_id"] = queue_order[next_idx]
+            reset_note_state()
+            st.rerun()
+        else:
+            st.warning(
+                "Label not saved due to Supabase error — please fix the issue above and try again.",
+                icon="⚠️",
+            )
     elif skip_clicked:
-        st.session_state.idx = min(idx + 1, len(rows) - 1)
+        current_pos = queue_order.index(req_id)
+        next_idx = current_pos + 1 if current_pos + 1 < len(queue_order) else current_pos
+        st.session_state.idx = next_idx
+        st.session_state["current_request_id"] = queue_order[next_idx]
         reset_note_state()
         st.rerun()
 

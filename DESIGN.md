@@ -42,24 +42,24 @@ Each label entry contains:
   "annotator_display": "string",
   "role": "annotator" | "reviewer",
   "timestamp": "ISO-8601",
-  "priority": "P1" | "P2" | "P3" | "P4",
+  "priority": "High" | "Medium" | "Low",
   "features": {
     "lying_face_down": bool,
     "safety_issue": bool,
     "drugs": bool,
-    "tents_present": bool,
+    "tents_count": integer,
     "blocking": bool,
     "on_ramp": bool,
     "propane_or_flame": bool,
     "children_present": bool,
     "wheelchair": bool,
     "num_people_bin": "0" | "1" | "2-3" | "4-5" | "6+",
-    "size_feet_bin": "0" | "1-20" | "21-80" | "81-150" | "150+"
+    "size_feet_bin": "0" | "1-20" | "21-80" | "81-150" | "150+",
+    "goa_window": "unknown" | "respond_sub2h" | "respond_2_6h" | "respond_6_24h" | "respond_over_24h",
   },
-  "abstain": bool,
-  "needs_review": bool,
-  "status": "pending" | "resolved",
   "notes": "string | null",
+  "review_status": "pending" | "agree" | "disagree",
+  "review_notes": "string | null",
   "image_paths": ["data/images/..."],
   "image_checksums": ["sha256:..."],
   "revision_of": "uuid | null"
@@ -71,27 +71,30 @@ Supabase table (`labels`) should mirror the schema above (JSONB column for `feat
 
 ## Streamlit Application Requirements
 - **Layout**: balanced grid where images (max 9 photos) share the screen with decision/status cards so annotators see visuals and outcomes without scrolling.
-- **Queue controls**: filters on photos/no photos, keywords, derived tags, and request status (`unlabeled`, `needs_review`, `conflict`, `labeled`). Deterministic seeding keeps the queue predictable.
-- **Auth & Roles**: login form backed by `config/annotators.json` (overridable via env var). Annotator identity is fixed for the session and stored with every label event.
+- **Queue controls**: filters on photos/no photos, keywords, derived tags, and request status (`unlabeled`, `needs_review`, `labeled`). Deterministic per-user ordering keeps the queue predictable without forcing everyone through the same sequence.
+- **Label workflow**: target two independent passes per request (primary label + reviewer). `MAX_ANNOTATORS_PER_REQUEST` gates participation (set to `2` for strict double labeling) while the UI surfaces prior submissions for context.
+- **Review surface**: reviewers see a previous submission card, choose a review decision (`agree`/`disagree`), and enter dedicated reviewer notes. The primary notes box stays optional for initial annotators.
+- **Prioritization**: default sorting favors rich-context items (images, notes) so the highest quality reports are labeled first; a sidebar toggle can force “photos or notes only.”
+- **Auth & Roles**: Streamlit’s native `st.login()` integrates with Auth0 (or any OIDC provider). All authenticated users have reviewer capabilities today; adjust roles later if needed.
 - **Persistence**: labels append to per-day JSONL logs (`data/labels/YYYYMMDD/labels.jsonl`). Each event includes a `label_id`, `revision_of`, and status flags to support reconciliation.
-- **Resilience**: handle missing images gracefully (show placeholders, surface fetch errors), allow keyboard-enabled navigation.
-- **Metrics**: surface counts for queue size, total labeled requests, conflicts, and per-status tallies.
+- **Resilience**: fail fast when Supabase credentials or dependencies are missing, surface actionable errors, and continue to handle missing images gracefully (show placeholders, surface fetch errors), allowing keyboard-enabled navigation.
+- **Metrics**: surface counts for queue size, total labeled requests, and per-status tallies.
 - **Planned upgrades**: see `docs/labeler_improvement_plan.md` for the snapshot ribbon, decision/status cards, outcome tags, and review workflow roadmap.
 
 ## Dataset Monitoring
 - Save audit snapshots (`data/audit/{timestamp}.json`) capturing counts of requests, photo coverage, keyword frequencies, district distribution.
 - Compare latest snapshot against prior to flag shifts (simple diff script or notebook).
-- Track labeling throughput using Supabase queries (or JSONL backups) to compute per-annotator counts, status mix, and conflicts; surface trends in a lightweight dashboard or scheduled notebook.
+- Track labeling throughput using Supabase queries (or JSONL backups) to compute per-annotator counts and status mix; surface trends in a lightweight dashboard or scheduled notebook.
 - Store checksum manifest for images to detect corrupt files; rerun fetch when checksum changes.
 
 ## Deployment Playbook
-1. **Supabase setup**: create a project, enable email auth with self-service sign-up, and create a `labels` table with columns matching the schema (use JSONB for `features`, arrays for `image_paths`/`image_checksums`). Configure RLS to allow authenticated users to insert/update their own rows and reviewers to read all data.
-2. **Secrets**: provide `SUPABASE_URL` + `SUPABASE_PUBLISHABLE_KEY` (or, if unavailable, an anon key) and optional `LABELER_DATA_DIR`, `LABELS_OUTPUT_DIR`, `LABELS_JSONL_BACKUP` via environment variables or Streamlit secrets.
+1. **Supabase setup**: create a project and run the migrations under `supabase/migrations/` to provision the `labels` table. The app now connects with the service-role key because identity is handled by Auth0/Streamlit.
+2. **Secrets**: provide `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, and Auth0 OIDC details in `.streamlit/secrets.toml` (`[auth]` block with `client_id`, `client_secret`, `redirect_uri`, `server_metadata_url`, `cookie_secret`). Optional knobs: `LABELER_DATA_DIR`, `LABELS_OUTPUT_DIR`, `LABELS_JSONL_BACKUP`, and `MAX_ANNOTATORS_PER_REQUEST`.
 3. **Build & deploy**: containerize or use Streamlit Community Cloud. During build run `uv sync`, `make transform`, `make fetch-images`, and mount persistent storage (S3/GCS or volume) for image cache + JSONL backups.
 4. **Runtime**: launch the Streamlit app with `streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0`. Ensure the container can reach Supabase and image storage.
 5. **Ops**: schedule `make transform`, `make fetch-images`, and `make audit --snapshot-out ...` (cron, GitHub Actions, or Cloud Scheduler) to refresh data and drop snapshots in storage. Use Supabase SQL or notebooks for reconciliation and exporting evaluation splits.
 
-GitHub Actions pipeline (`.github/workflows/data-refresh.yml`) runs the transform → fetch-images → audit sequence on every push to `main` and nightly; configure repository secrets (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, optional storage keys) before enabling it.
+GitHub Actions pipeline (`.github/workflows/data-refresh.yml`) runs the transform → fetch-images → audit sequence on every push to `main` and nightly; configure repository secrets (`SUPABASE_URL`, `SUPABASE_SECRET_KEY`, optional storage keys) before enabling it.
 
 ## Open Questions / Future Work
 - Conflict resolution workflow once multiple annotators submit conflicting priorities.

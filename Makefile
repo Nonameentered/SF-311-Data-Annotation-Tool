@@ -10,6 +10,21 @@ SIZE_MAX     ?= 400
 SHOW         ?= 10
 IMAGES_DIR   ?= data/images
 MANIFEST     ?= $(IMAGES_DIR)/manifest.jsonl
+GOA_FEATURES ?= data/derived/goa_features.parquet
+GOA_REPORT_DIR ?= data/reports
+GOA_EDA_DOC ?= docs/goa_eda.md
+GOA_TRENDS_DOC ?= docs/goa_trends.md
+GOA_FEATURES_DOC ?= docs/goa_features.md
+GOA_REPORT_DOC ?= docs/goa_analysis_report.md
+GOA_DAILY_PLOT ?= docs/assets/goa/goa_daily_rate.png
+
+EXPORT_DIR   ?= data/exports
+DEV_SECRETS ?= .streamlit/secrets.toml
+PROD_SECRETS ?= ~/.config/streamlit/prod.secrets.toml
+EXPORT_SECRETS ?=
+EXPORT_PREFIX ?=
+EXPORT_SINCE ?=
+EXPORT_FLAGS ?=
 
 .DEFAULT_GOAL := help
 
@@ -64,6 +79,70 @@ fetch-images: ## Download and cache images referenced in transformed data
 	  --input $(OUT_JSONL) \
 	  --out-dir $(IMAGES_DIR) \
 	  --manifest $(MANIFEST)
+
+.PHONY: export
+export: ## Export Supabase labels to JSONL/CSV (set EXPORT_SECRETS / EXPORT_FLAGS)
+	$(call _header,Export Labels)
+	$(UV) run python scripts/export_labels.py \
+	  --output-dir $(EXPORT_DIR) \
+	  $(if $(EXPORT_SECRETS),--secrets-file $(EXPORT_SECRETS),) \
+	  $(if $(EXPORT_PREFIX),--prefix $(EXPORT_PREFIX),) \
+	  $(if $(EXPORT_SINCE),--since $(EXPORT_SINCE),) \
+	  $(EXPORT_FLAGS)
+
+.PHONY: export-dev
+export-dev: EXPORT_SECRETS := $(DEV_SECRETS)
+export-dev: ## Export labels using local secrets file
+export-dev: export
+
+.PHONY: export-prod
+export-prod: EXPORT_SECRETS := $(PROD_SECRETS)
+export-prod: ## Export labels using production secrets file
+export-prod: export
+
+.PHONY: goa-data
+goa-data: ## Prepare responder GOA feature dataset
+	$(call _header,GOA Prepare)
+	$(UV) run python scripts/goa_prepare.py \
+	  --input $(OUT_PARQUET) \
+	  --output $(GOA_FEATURES)
+
+.PHONY: goa-eda
+goa-eda: goa-data ## Run baseline exploratory summaries for GOA
+	$(call _header,GOA EDA)
+	$(UV) run python scripts/goa_eda.py \
+	  --input $(GOA_FEATURES) \
+	  --report-dir $(GOA_REPORT_DIR) \
+	  --doc $(GOA_EDA_DOC) \
+	  --asset-dir docs/assets/goa
+
+.PHONY: goa-trends
+goa-trends: goa-data ## Generate daily/weekly GOA trends and resolution histograms
+	$(call _header,GOA Trends)
+	$(UV) run python scripts/goa_trends.py \
+	  --input $(GOA_FEATURES) \
+	  --report-dir $(GOA_REPORT_DIR) \
+	  --doc $(GOA_TRENDS_DOC)
+
+.PHONY: goa-features
+goa-features: goa-data ## Compute GOA feature-level correlations
+	$(call _header,GOA Features)
+	$(UV) run python scripts/goa_features.py \
+	  --input $(GOA_FEATURES) \
+	  --report-dir $(GOA_REPORT_DIR) \
+	  --doc $(GOA_FEATURES_DOC) \
+	  --asset-dir docs/assets/goa
+
+.PHONY: goa-report
+goa-report: goa-eda goa-trends goa-features ## Assemble comprehensive GOA report
+	$(call _header,GOA Report)
+	$(UV) run python scripts/goa_report.py \
+	  --features $(GOA_FEATURES) \
+	  --report-dir $(GOA_REPORT_DIR) \
+	  --output $(GOA_REPORT_DOC) \
+	  --daily-plot $(GOA_DAILY_PLOT) \
+	  --asset-dir docs/assets/goa
+
 
 .PHONY: labeler
 labeler: ## Launch Streamlit HITL labeler

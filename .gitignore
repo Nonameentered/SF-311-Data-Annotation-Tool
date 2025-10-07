@@ -28,3 +28,8 @@ config/annotators.json
 supabase/.temp/
 supabase/config.toml
 supabase/config.prod.toml
+
+
+data/*
+docs/*
+.streamlit/*
