@@ -695,9 +695,23 @@ def passes_minimal_filters(
     status_filter: str,
     annotator_uid: str,
     max_annotators: int,
+    case_status: Optional[str] = None,
+    goa_only: bool = False,
 ) -> bool:
     if has_photo is not None and bool(record.get("has_photo")) != has_photo:
         return False
+    if case_status is not None:
+        status_lower = str(record.get("status") or "").strip().lower()
+        closed_states = {"closed", "completed", "resolved"}
+        is_closed = status_lower in closed_states
+        if case_status == "open" and is_closed:
+            return False
+        if case_status == "closed" and not is_closed:
+            return False
+    if goa_only:
+        suggested, _ = suggest_outcome(record)
+        if suggested != "unable_to_locate":
+            return False
     annotators = unique_annotators(labels)
     mine = annotator_uid in annotators
     if status_filter == "unlabeled" and mine:
@@ -1060,6 +1074,19 @@ def main() -> None:
     has_photo = (
         None if has_photo == "any" else (True if has_photo == "with photos" else False)
     )
+    case_status = st.sidebar.selectbox(
+        "Case status", ["any", "open only", "closed only"], index=0
+    )
+    case_status_value: Optional[str] = None
+    if case_status == "open only":
+        case_status_value = "open"
+    elif case_status == "closed only":
+        case_status_value = "closed"
+    goa_only = st.sidebar.checkbox(
+        "Likely GOA (auto-suggested)",
+        value=False,
+        help="Include only cases whose notes/status suggest unable to locate / gone on arrival.",
+    )
     status_default = st.session_state.get("status_filter", STATUS_FILTER_OPTIONS[0])
     if status_default not in STATUS_FILTER_OPTIONS:
         status_default = STATUS_FILTER_OPTIONS[0]
@@ -1081,6 +1108,8 @@ def main() -> None:
         {
             "has_photo": has_photo,
             "status": status_filter,
+            "case_status": case_status_value,
+            "goa_only": bool(goa_only),
         },
         sort_keys=True,
     )
@@ -1112,6 +1141,8 @@ def main() -> None:
             status_filter=status_filter,
             annotator_uid=annotator_uid,
             max_annotators=MAX_ANNOTATORS,
+            case_status=case_status_value,
+            goa_only=bool(goa_only),
         ):
             working_ids.append(str(rid))
 
@@ -1378,16 +1409,6 @@ def main() -> None:
                     st.markdown(f"**{label}** — {desc}")
 
         latest_for_user = latest_label_for_annotator(existing_labels, annotator_uid)
-        if latest_for_user and keyboard_button(
-            "Load my last label",
-            shortcuts=["shift+l"],
-            button_type="secondary",
-            width="stretch",
-        ):
-            st.session_state["prefill"] = latest_for_user
-            reset_note_state()
-            st.rerun()
-
         prefill_candidate = st.session_state.pop("prefill", latest_for_user)
         prefill = prefill_candidate
         prefill_features = coerce_features(prefill) if prefill else {}
@@ -1471,8 +1492,10 @@ def main() -> None:
             key=widget_key("priority"),
         )
         priority_explanation = st.text_input(
-            "Priority rationale (optional)",
-            value=str((prefill or {}).get("priority_explanation") or ""),
+            "Priority rationale",
+            value=str(
+                (prefill or {}).get("features", {}).get("priority_explanation") or ""
+            ),
             help="Briefly explain why you chose this priority.",
             key=widget_key("priority_reason"),
         )
@@ -1491,8 +1514,8 @@ def main() -> None:
         )
         goa_window_value = goa_values[goa_labels.index(goa_selected_label)]
         goa_explanation = st.text_input(
-            "GOA rationale (optional)",
-            value=str((prefill or {}).get("goa_explanation") or ""),
+            "GOA rationale",
+            value=str((prefill or {}).get("features", {}).get("goa_explanation") or ""),
             help="Why this GOA window? Mention cues like movement, time of day, etc.",
             key=widget_key("goa_reason"),
         )
@@ -1521,8 +1544,10 @@ def main() -> None:
                 key=widget_key("routing_other"),
             )
         routing_explanation = st.text_input(
-            "Routing rationale (optional)",
-            value=str((prefill or {}).get("routing_explanation") or ""),
+            "Routing rationale",
+            value=str(
+                (prefill or {}).get("features", {}).get("routing_explanation") or ""
+            ),
             help="Why this department?",
             key=widget_key("routing_reason"),
         )
@@ -1948,7 +1973,6 @@ def main() -> None:
             "role": annotator_role,
             "timestamp": datetime.utcnow().isoformat(),
             "priority": priority_value,
-            "priority_explanation": (priority_explanation or None),
             "features": {
                 "lying_face_down": lying,
                 "safety_issue": safety,
@@ -1962,6 +1986,7 @@ def main() -> None:
                 "size_feet_bin": size_feet_bin,
                 "tents_count": int(tents_count),
                 "goa_window": goa_window_value,
+                "priority_explanation": (priority_explanation or None),
                 "goa_explanation": (goa_explanation or None),
                 "routing_department": routing_department,
                 "routing_other": routing_other.strip() or None,
