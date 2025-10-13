@@ -92,9 +92,13 @@ REQUIRED_UNIQUE_FOR_COMPLETION = max(1, min(MAX_ANNOTATORS, 2))
 st.markdown(
     """
     <style>
+    /* Add enough top padding so content clears the sticky app header */
     .block-container {
-        padding-top: 1.2rem !important;
+        padding-top: 3.5rem !important;
         padding-bottom: 1.6rem !important;
+    }
+    [data-testid="block-container"] {
+        padding-top: 3.5rem !important;
     }
     iframe[src*="streamlit_browser_storage"] {
         display: none !important;
