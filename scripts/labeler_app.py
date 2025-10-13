@@ -189,6 +189,7 @@ OUTCOME_OPTIONS: List[Tuple[str, str]] = [
     ("service_delivered", "Service delivered / resolved"),
     ("client_declined", "Client declined or not interested"),
     ("unable_to_locate", "Unable to locate client (Gone on arrival)"),
+    ("duplicate_report", "Duplicate report"),
     ("no_action_needed", "No action needed"),
     ("invalid_report", "Invalid report / not a 311 issue"),
     ("other", "Other outcome"),
@@ -250,11 +251,14 @@ def suggest_outcome(record: Dict[str, Any]) -> Tuple[Optional[str], str]:
     haystack = " ".join(text_parts).lower()
     rules: List[Tuple[str, List[str]]] = [
         (
+            "duplicate_report",
+            ["duplicate", "dupe", "dup.", "duplicate case"],
+        ),
+        (
             "invalid_report",
             [
                 "invalid",
                 "not a case",
-                "duplicate",
                 "spam",
                 "test case",
                 "wrong department",
