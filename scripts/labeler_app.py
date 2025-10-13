@@ -178,7 +178,7 @@ OUTCOME_OPTIONS: List[Tuple[str, str]] = [
     ("", "Select outcome alignment"),
     ("service_delivered", "Service delivered / resolved"),
     ("client_declined", "Client declined or not interested"),
-    ("unable_to_locate", "Unable to locate client"),
+    ("unable_to_locate", "Unable to locate client (Gone on arrival)"),
     ("no_action_needed", "No action needed"),
     ("invalid_report", "Invalid report / not a 311 issue"),
     ("other", "Other outcome"),
@@ -229,6 +229,52 @@ def outcome_display(value: Optional[str]) -> str:
         if key == value:
             return label
     return value.replace("_", " ").title()
+
+
+def suggest_outcome(record: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    text_parts: List[str] = []
+    for key in ("status_notes", "resolution_notes", "status"):
+        val = record.get(key)
+        if isinstance(val, str) and val.strip():
+            text_parts.append(val)
+    haystack = " ".join(text_parts).lower()
+    rules: List[Tuple[str, List[str]]] = [
+        (
+            "invalid_report",
+            [
+                "invalid",
+                "not a case",
+                "duplicate",
+                "spam",
+                "test case",
+                "wrong department",
+            ],
+        ),
+        (
+            "unable_to_locate",
+            ["gone on arrival", "unable to locate", "no longer there", "goa", "utl"],
+        ),
+        (
+            "service_delivered",
+            [
+                "service delivered",
+                "assisted",
+                "provided",
+                "resolved",
+                "cleaned",
+                "completed",
+            ],
+        ),
+        ("client_declined", ["declined", "refused", "not interested"]),
+        ("no_action_needed", ["no action needed", "nrn", "no further action"]),
+    ]
+    for outcome_value, keywords in rules:
+        if any(k in haystack for k in keywords):
+            return (
+                outcome_value,
+                f"Suggested from notes: {outcome_value.replace('_', ' ')}",
+            )
+    return None, ""
 
 
 def follow_up_display(values: Optional[Sequence[str]]) -> str:
@@ -395,6 +441,17 @@ def format_duration_hours(value: Any) -> str:
         return f"{round(hours, 1)} h"
     days = hours / 24.0
     return f"{round(days, 1)} days"
+
+
+def compute_dataset_cutoff(rows: List[Dict[str, Any]]) -> Optional[datetime]:
+    latest: Optional[datetime] = None
+    for r in rows:
+        ts = parse_created_at(r.get("updated_at")) or parse_created_at(
+            r.get("created_at")
+        )
+        if ts is not None and (latest is None or ts > latest):
+            latest = ts
+    return latest
 
 
 @st.cache_resource(show_spinner=False)
@@ -663,14 +720,30 @@ def status_badge(record: Dict[str, Any]) -> str:
     return f"🟡 {status_raw.title()}"
 
 
-def outcome_highlight(record: Dict[str, Any]) -> str:
-    status = str(record.get("status") or "Status unknown").strip()
-    duration = record.get("hours_to_resolution")
+def outcome_highlight(
+    record: Dict[str, Any], dataset_cutoff: Optional[datetime] = None
+) -> str:
+    status_raw = str(record.get("status") or "Status unknown").strip()
+    status_lower = status_raw.lower()
+    closed_states = {"closed", "completed", "resolved"}
     parts: List[str] = []
-    if status:
-        parts.append(status.title())
-    if duration is not None:
-        parts.append(f"after {format_duration_hours(duration)}")
+    if status_raw:
+        parts.append(status_raw.title())
+
+    # Show time to resolution for closed, time elapsed for open
+    if status_lower in closed_states:
+        duration = record.get("hours_to_resolution")
+        if duration is not None:
+            parts.append(f"after {format_duration_hours(duration)}")
+    else:
+        if dataset_cutoff is not None:
+            created_dt = parse_created_at(record.get("created_at"))
+            if created_dt is not None:
+                elapsed_hours = max(
+                    0.0, (dataset_cutoff - created_dt).total_seconds() / 3600.0
+                )
+                parts.append(f"for {format_duration_hours(elapsed_hours)}")
+
     summary = " ".join(parts) if parts else "Status unknown"
     notes = record.get("status_notes") or record.get("resolution_notes")
     if notes:
@@ -886,6 +959,7 @@ def main() -> None:
         st.rerun()
 
     rows_all = load_rows(RAW)
+    dataset_cutoff = compute_dataset_cutoff(rows_all)
     labels_by_request = load_labels_supabase(supabase_client)
 
     my_labels: List[Dict[str, Any]] = []
@@ -936,6 +1010,8 @@ def main() -> None:
             st.write(f"{key.replace('_', ' ').title()}: {status_counts.get(key, 0)}")
         st.write("—")
         st.write(f"With photos: {with_images}")
+        if dataset_cutoff is not None:
+            st.write(f"Dataset cutoff: {dataset_cutoff.isoformat()}")
 
     with st.sidebar.expander("My recent labels", expanded=False):
         if my_labels:
@@ -1122,12 +1198,25 @@ def main() -> None:
 
     summary_col, action_col = st.columns([5, 2], gap="small")
     with summary_col:
+        status_str = str(record.get("status") or "").strip().lower()
+        is_closed = status_str in {"closed", "completed", "resolved"}
+        time_label = "Time to resolution" if is_closed else "Time elapsed"
+        time_value = "—"
+        if is_closed:
+            time_value = format_duration_hours(record.get("hours_to_resolution"))
+        else:
+            created_dt = parse_created_at(record.get("created_at"))
+            if created_dt is not None and dataset_cutoff is not None:
+                elapsed_hours = max(
+                    0.0, (dataset_cutoff - created_dt).total_seconds() / 3600.0
+                )
+                time_value = format_duration_hours(elapsed_hours)
         st.caption(
             f"Queue {queue_size} · My labeled {my_labeled_count} · "
-            f"Index {idx + 1}/{queue_size} · Time to resolution {format_duration_hours(record.get('hours_to_resolution'))}"
+            f"Index {idx + 1}/{queue_size} · {time_label} {time_value}"
         )
         st.markdown(
-            f"**Case snapshot:** {status_badge(record)} · {outcome_highlight(record)}"
+            f"**Case snapshot:** {status_badge(record)} · {outcome_highlight(record, dataset_cutoff)}"
         )
 
     with action_col:
@@ -1546,12 +1635,18 @@ def main() -> None:
 
         outcome_values = [opt[0] for opt in OUTCOME_OPTIONS]
         outcome_labels = [opt[1] for opt in OUTCOME_OPTIONS]
-        prefill_outcome = ""
-        if prefill:
+        # Suggested outcome from notes/status
+        suggested_outcome, suggestion_reason = suggest_outcome(record)
+        chosen_outcome_default = ""
+        if priority_label == "Invalid":
+            chosen_outcome_default = "invalid_report"
+        elif suggested_outcome in outcome_values:
+            chosen_outcome_default = str(suggested_outcome)
+        elif prefill:
             raw_outcome = prefill.get("outcome_alignment")
             if raw_outcome in outcome_values:
-                prefill_outcome = str(raw_outcome)
-        default_outcome_index = outcome_values.index(prefill_outcome)
+                chosen_outcome_default = str(raw_outcome)
+        default_outcome_index = outcome_values.index(chosen_outcome_default)
         outcome_label = st.selectbox(
             "Outcome alignment",
             outcome_labels,
@@ -1567,6 +1662,10 @@ def main() -> None:
         outcome_alignment = outcome_values[outcome_labels.index(outcome_label)]
         if outcome_alignment == "":
             outcome_alignment = None
+        if priority_label == "Invalid":
+            st.caption("Suggested from priority: Invalid report / not a 311 issue")
+        elif suggested_outcome:
+            st.caption(suggestion_reason)
 
         follow_up_values = [opt[0] for opt in FOLLOW_UP_OPTIONS]
         follow_up_labels = [opt[1] for opt in FOLLOW_UP_OPTIONS]
