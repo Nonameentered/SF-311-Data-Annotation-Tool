@@ -131,7 +131,7 @@ FEATURE_DISPLAY_NAMES: Dict[str, str] = {
     "size_feet_bin": "Est. footprint (feet)",
 }
 
-PRIORITY_OPTIONS: Sequence[str] = ("High", "Medium", "Low")
+PRIORITY_OPTIONS: Sequence[str] = ("High", "Medium", "Low", "Invalid")
 PRIORITY_STORAGE = {label: label.lower() for label in PRIORITY_OPTIONS}
 PRIORITY_LEGACY_MAP = {
     "p1": "High",
@@ -166,6 +166,7 @@ LABEL_TIPS: Dict[str, str] = {
     "evidence_sources": "Select the sources you relied on (photos, notes, prior history, etc.).",
     "notes": "Capture rationale, escalation paths, or anomalies for reviewers.",
     "outcome_alignment": "How the observed outcome aligns with expectations or service goals.",
+    "outcome_alignment_open": "For open cases, choose the most likely outcome based on current evidence.",
     "follow_up_need": "Additional services that would help this case (multi-select).",
     "routing_department": "Primary team you expect to handle the request.",
     "goa_window": "Estimate when the subject might be gone if a team deploys now. Use the bucket that best fits your expectation.",
@@ -178,6 +179,8 @@ OUTCOME_OPTIONS: List[Tuple[str, str]] = [
     ("service_delivered", "Service delivered / resolved"),
     ("client_declined", "Client declined or not interested"),
     ("unable_to_locate", "Unable to locate client"),
+    ("no_action_needed", "No action needed"),
+    ("invalid_report", "Invalid report / not a 311 issue"),
     ("other", "Other outcome"),
 ]
 
@@ -1378,6 +1381,12 @@ def main() -> None:
             help=LABEL_TIPS["priority"],
             key=widget_key("priority"),
         )
+        priority_explanation = st.text_input(
+            "Priority rationale (optional)",
+            value=str((prefill or {}).get("priority_explanation") or ""),
+            help="Briefly explain why you chose this priority.",
+            key=widget_key("priority_reason"),
+        )
         goa_values = [value for value, _ in GOA_WINDOW_OPTIONS]
         goa_labels = [label for _, label in GOA_WINDOW_OPTIONS]
         goa_default = resolve_goa_window(initial_features)
@@ -1392,6 +1401,12 @@ def main() -> None:
             key=widget_key("goa_window"),
         )
         goa_window_value = goa_values[goa_labels.index(goa_selected_label)]
+        goa_explanation = st.text_input(
+            "GOA rationale (optional)",
+            value=str((prefill or {}).get("goa_explanation") or ""),
+            help="Why this GOA window? Mention cues like movement, time of day, etc.",
+            key=widget_key("goa_reason"),
+        )
 
         review_status = "pending"
 
@@ -1416,6 +1431,12 @@ def main() -> None:
                 value=routing_other_default,
                 key=widget_key("routing_other"),
             )
+        routing_explanation = st.text_input(
+            "Routing rationale (optional)",
+            value=str((prefill or {}).get("routing_explanation") or ""),
+            help="Why this department?",
+            key=widget_key("routing_reason"),
+        )
 
         st.markdown("### 3. On-scene observations")
         feature_options = [
@@ -1535,7 +1556,12 @@ def main() -> None:
             "Outcome alignment",
             outcome_labels,
             index=default_outcome_index,
-            help=LABEL_TIPS["outcome_alignment"],
+            help=(
+                LABEL_TIPS["outcome_alignment_open"]
+                if str(record.get("status")).strip().lower()
+                not in {"closed", "completed", "resolved"}
+                else LABEL_TIPS["outcome_alignment"]
+            ),
             key=widget_key("outcome_alignment"),
         )
         outcome_alignment = outcome_values[outcome_labels.index(outcome_label)]
@@ -1823,6 +1849,7 @@ def main() -> None:
             "role": annotator_role,
             "timestamp": datetime.utcnow().isoformat(),
             "priority": priority_value,
+            "priority_explanation": (priority_explanation or None),
             "features": {
                 "lying_face_down": lying,
                 "safety_issue": safety,
@@ -1836,8 +1863,10 @@ def main() -> None:
                 "size_feet_bin": size_feet_bin,
                 "tents_count": int(tents_count),
                 "goa_window": goa_window_value,
+                "goa_explanation": (goa_explanation or None),
                 "routing_department": routing_department,
                 "routing_other": routing_other.strip() or None,
+                "routing_explanation": (routing_explanation or None),
             },
             "notes": notes.strip() or None,
             "evidence_sources": info_sources,
