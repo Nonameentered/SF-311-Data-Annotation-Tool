@@ -6,6 +6,7 @@ import os
 import sys
 import uuid
 from copy import deepcopy
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -62,7 +63,6 @@ DATA = Path(get_secret("LABELER_DATA_DIR", "data"))
 RAW = DATA / "transformed.jsonl"
 LABELS_DIR = Path(get_secret("LABELS_OUTPUT_DIR", str(DATA / "labels")))
 MAX_ANNOTATORS = int(get_secret("MAX_ANNOTATORS_PER_REQUEST", "3"))
-ANNOTATORS_LIMIT = min(MAX_ANNOTATORS, 2)
 SUPABASE_URL = get_secret("SUPABASE_URL")
 
 SUPABASE_PUBLISHABLE_KEY = get_secret("SUPABASE_PUBLISHABLE_KEY")
@@ -208,7 +208,6 @@ TAG_FILTER_OPTIONS: List[Tuple[str, str]] = [
 
 STATUS_FILTER_OPTIONS: List[str] = [
     "unlabeled",
-    "needs_review",
     "labeled",
     "all",
 ]
@@ -534,6 +533,123 @@ def rich_context_score(record: Dict[str, Any]) -> float:
     return score
 
 
+@st.cache_data(show_spinner=False)
+def compute_dataset_hash(path: Path) -> str:
+    if not path.exists():
+        return "missing"
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:  # noqa: BLE001
+        # Fallback to size+mtime if content hashing fails
+        try:
+            stt = path.stat()
+            sig = f"{stt.st_size}:{int(stt.st_mtime)}".encode("utf-8")
+            return hashlib.sha256(sig).hexdigest()
+        except Exception:  # noqa: BLE001
+            return str(uuid.uuid4())
+
+
+# Supabase helpers for per-user queues
+def load_saved_queue(
+    client: Client, annotator_uid: str, dataset_hash: str
+) -> Optional[Dict[str, Any]]:
+    try:  # pragma: no cover - requires Supabase
+        resp = (
+            client.table("annotator_queues")
+            .select("*")
+            .eq("annotator_uid", annotator_uid)
+            .eq("dataset_hash", dataset_hash)
+            .execute()
+        )
+        rows = resp.data or []
+        if rows:
+            return rows[0]
+        return None
+    except Exception as exc:
+        st.error(f"Failed to load saved queue: {exc}")
+        return None
+
+
+def save_queue(
+    client: Client,
+    annotator_uid: str,
+    dataset_hash: str,
+    queue: List[str],
+    position: int = 0,
+) -> bool:
+    payload = {
+        "annotator_uid": annotator_uid,
+        "dataset_hash": dataset_hash,
+        "queue": queue,
+        "position": int(position),
+    }
+    try:  # pragma: no cover - requires Supabase
+        client.table("annotator_queues").upsert(payload).execute()
+        return True
+    except Exception as exc:
+        st.error(f"Failed to save queue: {exc}")
+        return False
+
+
+def update_queue_position(
+    client: Client, annotator_uid: str, dataset_hash: str, position: int
+) -> None:
+    try:  # pragma: no cover - requires Supabase
+        (
+            client.table("annotator_queues")
+            .update({"position": int(position)})
+            .eq("annotator_uid", annotator_uid)
+            .eq("dataset_hash", dataset_hash)
+            .execute()
+        )
+    except Exception as exc:
+        st.error(f"Failed to update queue position: {exc}")
+
+
+def build_photo_first_order(
+    rows: List[Dict[str, Any]], annotator_uid: str
+) -> List[str]:
+    photo_ids = [str(r.get("request_id")) for r in rows if r.get("has_photo")]
+    nophoto_ids = [str(r.get("request_id")) for r in rows if not r.get("has_photo")]
+    # Deterministic per-user shuffle
+    seed_bytes = hashlib.sha256(f"queue:{annotator_uid}".encode("utf-8")).digest()
+    seed_int = int.from_bytes(seed_bytes[:8], "big")
+    rng = random.Random(seed_int)
+    rng.shuffle(photo_ids)
+    rng.shuffle(nophoto_ids)
+    return photo_ids + nophoto_ids
+
+
+def passes_minimal_filters(
+    record: Dict[str, Any],
+    labels: List[Dict[str, Any]],
+    *,
+    has_photo: Optional[bool],
+    status_filter: str,
+    annotator_uid: str,
+    max_annotators: int,
+) -> bool:
+    if has_photo is not None and bool(record.get("has_photo")) != has_photo:
+        return False
+    annotators = unique_annotators(labels)
+    mine = annotator_uid in annotators
+    if status_filter == "unlabeled" and mine:
+        return False
+    if status_filter == "labeled" and not mine:
+        return False
+    # Skip if already at cap and not mine
+    if not mine and len(annotators) >= max_annotators:
+        return False
+    return True
+
+
 def status_badge(record: Dict[str, Any]) -> str:
     status_raw = str(record.get("status") or "Unknown").strip()
     closed_states = {"closed", "completed", "resolved"}
@@ -679,7 +795,7 @@ def subset(
                 continue
         if only_mine and annotator_uid not in unique_annotators(labels):
             continue
-        if not can_annotator_label(labels, annotator_uid, ANNOTATORS_LIMIT):
+        if not can_annotator_label(labels, annotator_uid, MAX_ANNOTATORS):
             continue
         out_rows.append(r)
     return out_rows
@@ -740,7 +856,8 @@ def main() -> None:
                 ):
                     previous_id = undo_context.get("request_id")
                     if previous_id:
-                        st.session_state["pending_request_id"] = str(previous_id)
+                        # Mark a navigation intent back to the undone item; handled after queue is built
+                        st.session_state["undo_jump_request_id"] = str(previous_id)
                 previous_prefill = undo_context.get("previous_prefill")
                 if previous_prefill:
                     st.session_state["prefill"] = previous_prefill
@@ -812,11 +929,10 @@ def main() -> None:
     st.sidebar.header("Queue filters")
     with st.sidebar.expander("Queue snapshot", expanded=False):
         st.write(f"Total requests: {len(rows_all)}")
-        for key in ["unlabeled", "needs_review", "labeled"]:
+        for key in ["unlabeled", "labeled"]:
             st.write(f"{key.replace('_', ' ').title()}: {status_counts.get(key, 0)}")
         st.write("—")
         st.write(f"With photos: {with_images}")
-        st.write(f"With status notes: {with_notes}")
 
     with st.sidebar.expander("My recent labels", expanded=False):
         if my_labels:
@@ -859,40 +975,12 @@ def main() -> None:
         else:
             st.caption("No saved labels yet.")
 
-    # Quick mode presets
-    preset_cols = st.sidebar.columns(2)
-    with preset_cols[0]:
-        if st.button("Label mode"):
-            st.session_state["status_filter"] = "unlabeled"
-            st.session_state["only_mine"] = False
-            st.session_state["queue_search"] = ""
-            st.session_state["reset"] = True
-            st.rerun()
-    with preset_cols[1]:
-        if st.button("Review mode"):
-            st.session_state["status_filter"] = "needs_review"
-            st.session_state["only_mine"] = False
-            st.session_state["queue_search"] = ""
-            st.session_state["reset"] = True
-            st.rerun()
-
-    has_photo = st.sidebar.selectbox("Has photo?", ["any", "with photos", "no photos"])
+    has_photo = st.sidebar.selectbox(
+        "Photo status", ["any", "with photos", "no photos"]
+    )
     has_photo = (
         None if has_photo == "any" else (True if has_photo == "with photos" else False)
     )
-    kw_labels = [label for _, label in KEYWORD_FILTER_OPTIONS]
-    kw_label_to_key = {label: key for key, label in KEYWORD_FILTER_OPTIONS}
-    kw_selected_labels = st.sidebar.multiselect(
-        "Must include keywords", kw_labels, default=[]
-    )
-    kw_filters = [kw_label_to_key[label] for label in kw_selected_labels]
-
-    tag_labels = [label for _, label in TAG_FILTER_OPTIONS]
-    tag_label_to_key = {label: key for key, label in TAG_FILTER_OPTIONS}
-    tag_selected_labels = st.sidebar.multiselect(
-        "Must include tags", tag_labels, default=[]
-    )
-    tag_filters = [tag_label_to_key[label] for label in tag_selected_labels]
     status_default = st.session_state.get("status_filter", STATUS_FILTER_OPTIONS[0])
     if status_default not in STATUS_FILTER_OPTIONS:
         status_default = STATUS_FILTER_OPTIONS[0]
@@ -902,34 +990,7 @@ def main() -> None:
         index=STATUS_FILTER_OPTIONS.index(status_default),
     )
     st.session_state["status_filter"] = status_filter
-    search_text = st.sidebar.text_input(
-        "Search queue",
-        value=st.session_state.get("queue_search", ""),
-        placeholder="Request ID or keywords",
-    )
-    st.session_state["queue_search"] = search_text
-    only_mine_default = bool(st.session_state.get("only_mine", False))
-    only_mine = st.sidebar.checkbox(
-        "Only requests I've labeled", value=only_mine_default
-    )
-    st.session_state["only_mine"] = only_mine
-    require_rich_context = st.sidebar.checkbox(
-        "Require photos or notes",
-        value=False,
-        help="When enabled, the queue will only include requests that already have photos or 311 responder notes.",
-    )
-    sort_options = [
-        "Recommended order",
-        "Oldest first",
-        "Newest first",
-        "Request ID",
-    ]
-    sort_mode = st.sidebar.selectbox(
-        "Sort order",
-        sort_options,
-        index=0,
-        help="Recommended order prioritizes items needing review, then unlabeled requests with photos, while keeping a consistent per-user shuffle.",
-    )
+    # Remove advanced filters to keep UX simple
     if st.sidebar.button("Reset queue"):
         st.session_state["reset"] = True
 
@@ -939,37 +1000,55 @@ def main() -> None:
 
     queue_signature = json.dumps(
         {
-            "sort": sort_mode,
             "has_photo": has_photo,
-            "kw": sorted(kw_filters),
-            "tags": sorted(tag_filters),
             "status": status_filter,
-            "search": search_text.strip(),
-            "only_mine": only_mine,
-            "require_context": require_rich_context,
         },
         sort_keys=True,
     )
 
-    rows = subset(
-        rows_all,
-        has_photo=has_photo,
-        kw_filters=kw_filters,
-        tag_filters=tag_filters,
-        status_filter=status_filter,
-        labels_by_request=labels_by_request,
-        annotator_uid=annotator_uid,
-        search_text=search_text,
-        only_mine=only_mine,
-        require_rich_context=require_rich_context,
-    )
+    # Build or load per-user queue (photo-first, stable). Do not reorder per interaction.
+    dataset_hash = compute_dataset_hash(RAW)
+    saved = load_saved_queue(supabase_client, annotator_uid, dataset_hash)
+    if saved is None:
+        base_order = build_photo_first_order(rows_all, annotator_uid)
+        save_queue(supabase_client, annotator_uid, dataset_hash, base_order, 0)
+        saved = {"queue": base_order, "position": 0}
+    base_queue_ids: List[str] = list(saved.get("queue") or [])
+    position = int(saved.get("position") or 0)
+
+    # Construct filtered working set without changing base order
+    rows_by_id_all: Dict[str, Dict[str, Any]] = {
+        str(r.get("request_id")): r for r in rows_all
+    }
+    working_ids: List[str] = []
+    for rid in base_queue_ids:
+        rec = rows_by_id_all.get(str(rid))
+        if not rec:
+            continue
+        labels = labels_by_request.get(str(rid), [])
+        if passes_minimal_filters(
+            rec,
+            labels,
+            has_photo=has_photo,
+            status_filter=status_filter,
+            annotator_uid=annotator_uid,
+            max_annotators=MAX_ANNOTATORS,
+        ):
+            working_ids.append(str(rid))
+
+    if not working_ids:
+        st.warning("No items matching the filters. Adjust the sidebar.")
+        st.stop()
+
+    rows = [rows_by_id_all[rid] for rid in working_ids]
 
     def recommended_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
         rid = str(record.get("request_id"))
         status = status_by_request.get(rid, "labeled")
+        # With review mode removed, prioritize unlabeled first, then others by context/recency
         status_priority = {
-            "needs_review": 0,
-            "unlabeled": 1,
+            "unlabeled": 0,
+            "needs_review": 1,
             "labeled": 2,
         }
         status_score = status_priority.get(status, 4)
@@ -979,26 +1058,14 @@ def main() -> None:
         user_random = user_random_value(rid, annotator_uid)
         return (status_score, photo_score, context_score, recency_score, user_random)
 
-    sort_functions = {
-        "Recommended order": recommended_key,
-        "Oldest first": lambda r: parse_created_at(r.get("created_at")) or datetime.max,
-        "Newest first": lambda r: parse_created_at(r.get("created_at")) or datetime.min,
-        "Request ID": lambda r: str(r.get("request_id") or ""),
-    }
-
-    current_sort_key = sort_functions.get(sort_mode, recommended_key)
-    rows.sort(key=current_sort_key, reverse=sort_mode == "Newest first")
+    # No per-interaction sorting; order is stable based on per-user queue
 
     if not rows:
         st.warning("No items matching the filters. Adjust the sidebar.")
         st.stop()
 
-    request_ids: List[str] = []
-    rows_by_id: Dict[str, Dict[str, Any]] = {}
-    for row in rows:
-        rid = str(row.get("request_id"))
-        request_ids.append(rid)
-        rows_by_id[rid] = row
+    request_ids: List[str] = [str(r.get("request_id")) for r in rows]
+    rows_by_id: Dict[str, Dict[str, Any]] = {str(r.get("request_id")): r for r in rows}
 
     reset_requested = st.session_state.pop("reset", False)
 
@@ -1022,6 +1089,12 @@ def main() -> None:
         pos = 0
     st.session_state["queue_pos"] = pos
 
+    # If there is an undo jump requested, navigate to that request's index in the frozen queue
+    undo_jump_id = st.session_state.pop("undo_jump_request_id", None)
+    if undo_jump_id and undo_jump_id in queue_ids:
+        pos = queue_ids.index(undo_jump_id)
+        st.session_state["queue_pos"] = pos
+
     current_id = queue_ids[pos]
     st.session_state["current_request_id"] = current_id
     idx = pos
@@ -1031,7 +1104,7 @@ def main() -> None:
     req_id = current_id
     existing_labels = sort_labels(labels_by_request.get(req_id, []))
     latest_other_label = latest_label_excluding(existing_labels, annotator_uid)
-    review_mode = latest_other_label is not None
+    review_mode = False
     current_status = request_status(existing_labels, REQUIRED_UNIQUE_FOR_COMPLETION)
 
     def widget_key(name: str) -> str:
@@ -1041,10 +1114,13 @@ def main() -> None:
     save_clicked = False
     skip_clicked = False
 
+    # Count of unique requests labeled by current user (for privacy-forward UI)
+    my_labeled_count = len({item["request_id"] for item in my_labels})
+
     summary_col, action_col = st.columns([5, 2], gap="small")
     with summary_col:
         st.caption(
-            f"Queue {queue_size} · Labeled {len([r for r in labels_by_request if labels_by_request[r]])} · "
+            f"Queue {queue_size} · My labeled {my_labeled_count} · "
             f"Index {idx + 1}/{queue_size} · Time to resolution {format_duration_hours(record.get('hours_to_resolution'))}"
         )
         st.markdown(
@@ -1197,63 +1273,7 @@ def main() -> None:
             st.caption(" · ".join(image_caption_parts))
 
     with right:
-        if review_mode and latest_other_label:
-            reviewer_banner = st.container()
-            with reviewer_banner:
-                st.warning(
-                    "Review mode: confirm or adjust the prior submission. Log disagreements and add reviewer notes.",
-                    icon="📝",
-                )
-                prev_features = coerce_features(latest_other_label)
-                prev_summary_rows = [
-                    (
-                        "Previous review",
-                        REVIEW_STATUS_LABELS.get(
-                            latest_other_label.get("review_status") or "pending",
-                            REVIEW_STATUS_LABELS["pending"],
-                        ),
-                    ),
-                    (
-                        "Previous annotator",
-                        latest_other_label.get("annotator_display")
-                        or latest_other_label.get("annotator")
-                        or "—",
-                    ),
-                    (
-                        "Saved at",
-                        format_timestamp(latest_other_label.get("timestamp")),
-                    ),
-                    (
-                        "Priority",
-                        (latest_other_label.get("priority") or "—").title(),
-                    ),
-                    (
-                        "GOA expectation",
-                        goa_window_label(resolve_goa_window(prev_features)),
-                    ),
-                    (
-                        "Tents count",
-                        (
-                            prev_features.get("tents_count")
-                            if prev_features.get("tents_count") is not None
-                            else "—"
-                        ),
-                    ),
-                    (
-                        "Routing dept.",
-                        prev_features.get("routing_department") or "—",
-                    ),
-                ]
-                prev_df = pd.DataFrame(
-                    prev_summary_rows, columns=["Field", "Previous value"]
-                )
-                st.dataframe(prev_df, use_container_width=True, hide_index=True)
-                if latest_other_label.get("notes"):
-                    st.caption("Previous notes")
-                    st.write(latest_other_label["notes"])
-                if latest_other_label.get("review_notes"):
-                    st.caption("Previous reviewer notes")
-                    st.write(latest_other_label["review_notes"])
+        # Review banner removed
 
         glossary_pairs = list(FIELD_GLOSSARY.items())
         if hasattr(st, "popover"):
@@ -1277,8 +1297,6 @@ def main() -> None:
             st.rerun()
 
         prefill_candidate = st.session_state.pop("prefill", latest_for_user)
-        if prefill_candidate is None and review_mode and latest_other_label:
-            prefill_candidate = latest_other_label
         prefill = prefill_candidate
         prefill_features = coerce_features(prefill) if prefill else {}
         record_defaults = record_feature_defaults(record)
@@ -1345,14 +1363,6 @@ def main() -> None:
         priority_index = PRIORITY_OPTIONS.index(priority_label_default)
 
         review_status_default = "pending"
-        if (
-            prefill_from_self
-            and prefill
-            and (prefill.get("review_status") in REVIEW_STATUS_LABELS)
-        ):
-            review_status_default = prefill["review_status"]
-        elif review_mode:
-            review_status_default = "agree"
 
         if prefill_from_self and prefill:
             review_notes_default = prefill.get("review_notes") or ""
@@ -1383,20 +1393,7 @@ def main() -> None:
         )
         goa_window_value = goa_values[goa_labels.index(goa_selected_label)]
 
-        if review_mode:
-            review_status = st.radio(
-                "Review decision",
-                ["agree", "disagree"],
-                index=["agree", "disagree"].index(
-                    review_status_default
-                    if review_status_default in ["agree", "disagree"]
-                    else "agree"
-                ),
-                help=LABEL_TIPS["review_status"],
-                key=widget_key("review_status"),
-            )
-        else:
-            review_status = "pending"
+        review_status = "pending"
 
         priority_value = PRIORITY_STORAGE[priority_label]
 
@@ -1501,16 +1498,7 @@ def main() -> None:
             help=LABEL_TIPS["notes"],
         )
 
-        if review_mode:
-            review_notes = st.text_area(
-                "Reviewer notes",
-                value=review_notes_default,
-                height=110,
-                help=LABEL_TIPS["review_notes"],
-                key=widget_key("review_notes"),
-            )
-        else:
-            review_notes = ""
+        review_notes = ""
 
         info_source_options = [
             "Photos",
@@ -1594,35 +1582,7 @@ def main() -> None:
                 for k in record.keys()
                 if k.startswith("kw_") and record[k]
             ]
-            review_display = REVIEW_STATUS_LABELS.get(
-                review_status, REVIEW_STATUS_LABELS["pending"]
-            )
-            summary_rows.append(("Review decision", review_display))
-            if review_notes and isinstance(review_notes, str) and review_notes.strip():
-                summary_rows.append(("Reviewer notes", review_notes.strip()))
-            if review_mode and latest_other_label:
-                prev_features = coerce_features(latest_other_label)
-                prev_goa_value = resolve_goa_window(prev_features)
-                summary_rows.extend(
-                    [
-                        (
-                            "Previous priority",
-                            latest_other_label.get("priority") or "—",
-                        ),
-                        (
-                            "Prev. GOA expectation",
-                            goa_window_label(prev_goa_value),
-                        ),
-                        (
-                            "Prev. tents count",
-                            (
-                                prev_features.get("tents_count")
-                                if prev_features.get("tents_count") is not None
-                                else "—"
-                            ),
-                        ),
-                    ]
-                )
+            # Review summary removed
 
             summary_rows.extend(
                 [
@@ -1719,53 +1679,65 @@ def main() -> None:
 
         with history_tab:
             if existing_labels:
-                history_df = pd.DataFrame(
-                    [
-                        {
-                            "timestamp": format_timestamp(entry.get("timestamp")),
-                            "annotator": entry.get("annotator_display")
-                            or entry.get("annotator")
-                            or entry.get("annotator_uid")
-                            or "—",
-                            "routing": (entry.get("features") or {}).get(
-                                "routing_department"
-                            )
-                            or "—",
-                            "tents": (
-                                str((entry.get("features") or {}).get("tents_count"))
-                                if (entry.get("features") or {}).get("tents_count")
-                                is not None
-                                else "—"
-                            ),
-                            "observed": ", ".join(
-                                [
-                                    FEATURE_DISPLAY_NAMES.get(
-                                        key, key.replace("_", " ").title()
+                my_history = [
+                    entry
+                    for entry in existing_labels
+                    if str(
+                        entry.get("annotator_uid")
+                        or entry.get("annotator")
+                        or entry.get("annotator_email")
+                    )
+                    == annotator_uid
+                ]
+                if my_history:
+                    history_df = pd.DataFrame(
+                        [
+                            {
+                                "timestamp": format_timestamp(entry.get("timestamp")),
+                                "annotator": entry.get("annotator_display")
+                                or entry.get("annotator")
+                                or entry.get("annotator_uid")
+                                or "—",
+                                "routing": (entry.get("features") or {}).get(
+                                    "routing_department"
+                                )
+                                or "—",
+                                "tents": (
+                                    str(
+                                        (entry.get("features") or {}).get("tents_count")
                                     )
-                                    for key, value in (
-                                        (entry.get("features") or {})
-                                    ).items()
-                                    if isinstance(value, bool)
-                                    and value
-                                    and key in FEATURE_DISPLAY_NAMES
-                                ]
-                            )
-                            or "—",
-                            "follow_up": follow_up_display(entry.get("follow_up_need")),
-                            "outcome": outcome_display(entry.get("outcome_alignment")),
-                            "evidence": ", ".join(entry.get("evidence_sources") or []),
-                            "notes": entry.get("notes") or "",
-                            "review_decision": REVIEW_STATUS_LABELS.get(
-                                entry.get("review_status") or "pending",
-                                REVIEW_STATUS_LABELS["pending"],
-                            ),
-                            "review_notes": entry.get("review_notes") or "",
-                        }
-                        for entry in existing_labels
-                    ]
-                )
+                                    if (entry.get("features") or {}).get("tents_count")
+                                    is not None
+                                    else "—"
+                                ),
+                                "observed": ", ".join(
+                                    [
+                                        FEATURE_DISPLAY_NAMES.get(
+                                            key, key.replace("_", " ").title()
+                                        )
+                                        for key, value in (
+                                            (entry.get("features") or {})
+                                        ).items()
+                                        if isinstance(value, bool)
+                                        and value
+                                        and key in FEATURE_DISPLAY_NAMES
+                                    ]
+                                )
+                                or "—",
+                                "follow_up": follow_up_display(
+                                    entry.get("follow_up_need")
+                                ),
+                                "outcome": outcome_display(
+                                    entry.get("outcome_alignment")
+                                ),
+                            }
+                            for entry in my_history
+                        ]
+                    )
 
-                st.dataframe(history_df, use_container_width=True, hide_index=True)
+                    st.dataframe(history_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No labels yet")
             else:
                 st.info("No labels yet")
 
@@ -1778,7 +1750,18 @@ def main() -> None:
             with raw_images_tab:
                 st.json(images)
             with raw_labels_tab:
-                st.json(existing_labels)
+                st.json(
+                    [
+                        entry
+                        for entry in existing_labels
+                        if str(
+                            entry.get("annotator_uid")
+                            or entry.get("annotator")
+                            or entry.get("annotator_email")
+                        )
+                        == annotator_uid
+                    ]
+                )
 
     col_prev, col_save, col_skip = st.columns([1, 1, 1])
 
@@ -1815,31 +1798,21 @@ def main() -> None:
         reset_note_state()
         st.rerun()
     elif save_clicked:
-        # Enforce annotator cap at save-time as an extra guard
+        # Re-check annotator cap before saving; skip if already at cap and not mine
         existing_annotators = unique_annotators(existing_labels)
-        if (annotator_uid not in existing_annotators) and (
-            len(existing_annotators) >= ANNOTATORS_LIMIT
+        if (
+            annotator_uid not in existing_annotators
+            and len(existing_annotators) >= MAX_ANNOTATORS
         ):
-            st.error(
-                "This request already has two labels; moving to the next item.",
-                icon="⚠️",
-            )
+            st.info("This request already has enough labels; advancing to next.")
             st.session_state["queue_pos"] = (idx + 1) % queue_size
+            try:
+                update_queue_position(supabase_client, annotator_uid, dataset_hash, st.session_state["queue_pos"])  # type: ignore[arg-type]
+            except Exception:
+                pass
             reset_note_state()
             st.rerun()
-        if review_mode:
-            if review_status not in ["agree", "disagree"]:
-                st.error(
-                    "Select whether you agree or disagree with the previous label.",
-                    icon="⚠️",
-                )
-                st.stop()
-            if not review_notes or not review_notes.strip():
-                st.error(
-                    "Reviewer notes are required when you approve or change a prior label.",
-                    icon="⚠️",
-                )
-                st.stop()
+        # Optional: could enforce stricter cap in DB; user opted not to enforce here.
         label_id = str(uuid.uuid4())
         payload = {
             "label_id": label_id,
@@ -1873,12 +1846,8 @@ def main() -> None:
             "image_paths": record.get("image_paths"),
             "image_checksums": record.get("image_checksums"),
             "revision_of": prefill.get("label_id") if prefill else None,
-            "review_status": review_status,
-            "review_notes": (
-                review_notes.strip()
-                if isinstance(review_notes, str) and review_notes.strip()
-                else None
-            ),
+            "review_status": "pending",
+            "review_notes": None,
         }
         if save_label(payload, supabase_client, enable_file_backup):
             st.session_state["undo_context"] = {
@@ -1889,6 +1858,11 @@ def main() -> None:
                 "timestamp": datetime.utcnow().isoformat(),
             }
             st.session_state["queue_pos"] = (idx + 1) % queue_size
+            # Persist position to Supabase
+            try:
+                update_queue_position(supabase_client, annotator_uid, dataset_hash, st.session_state["queue_pos"])  # type: ignore[arg-type]
+            except Exception:
+                pass
             reset_note_state()
             st.rerun()
         else:
@@ -1898,6 +1872,10 @@ def main() -> None:
             )
     elif skip_clicked:
         st.session_state["queue_pos"] = (idx + 1) % queue_size
+        try:
+            update_queue_position(supabase_client, annotator_uid, dataset_hash, st.session_state["queue_pos"])  # type: ignore[arg-type]
+        except Exception:
+            pass
         reset_note_state()
         st.rerun()
 
