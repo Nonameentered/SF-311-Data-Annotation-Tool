@@ -17,6 +17,12 @@ from streamlit.errors import StreamlitAPIException
 
 APP_TITLE = "SF311 Priority Labeler — Human-in-the-Loop"
 
+# Page config: wide mode by default
+try:
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+except Exception:
+    pass
+
 StreamlitSecretNotFoundError = StreamlitAPIException
 
 try:
@@ -87,7 +93,7 @@ st.markdown(
     """
     <style>
     .block-container {
-        padding-top: 0.8rem !important;
+        padding-top: 1.2rem !important;
         padding-bottom: 1.6rem !important;
     }
     iframe[src*="streamlit_browser_storage"] {
@@ -1052,9 +1058,9 @@ def main() -> None:
                 label_text = f"{entry['request_id']} · {entry.get('priority') or '—'} · {formatted_time}"
                 option_map[label_text] = entry
 
-            st.dataframe(
-                pd.DataFrame(preview_rows), use_container_width=True, hide_index=True
-            )
+                st.dataframe(
+                    pd.DataFrame(preview_rows), width="stretch", hide_index=True
+                )
 
             select_choices = ["None"] + list(option_map.keys())
             selected_option = st.selectbox("Jump to request", select_choices)
@@ -1432,7 +1438,7 @@ def main() -> None:
                 f"Viewing photo {current_index + 1} of {num_images}"
             )
             if image_source:
-                st.image(image_source, use_container_width=True)
+                st.image(image_source, width="stretch")
             else:
                 st.warning("This photo could not be loaded.")
             st.caption(" · ".join(image_caption_parts))
@@ -1853,7 +1859,7 @@ def main() -> None:
                 ]
             )
             summary_df = pd.DataFrame(summary_rows, columns=["Attribute", "Value"])
-            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+            st.dataframe(summary_df, width="stretch", hide_index=True)
 
             auto_flags = {
                 FEATURE_DISPLAY_NAMES["lying_face_down"]: record.get(
@@ -1867,7 +1873,7 @@ def main() -> None:
             }
             auto_df = pd.DataFrame([auto_flags])
             st.caption("Auto-tags from transform")
-            st.dataframe(auto_df, use_container_width=True, hide_index=True)
+            st.dataframe(auto_df, width="stretch", hide_index=True)
 
         with history_tab:
             if existing_labels:
@@ -1927,7 +1933,7 @@ def main() -> None:
                         ]
                     )
 
-                    st.dataframe(history_df, use_container_width=True, hide_index=True)
+                    st.dataframe(history_df, width="stretch", hide_index=True)
                 else:
                     st.info("No labels yet")
             else:
