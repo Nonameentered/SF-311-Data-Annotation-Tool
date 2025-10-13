@@ -968,13 +968,14 @@ def main() -> None:
                         if previous_id:
                             # Mark a navigation intent back to the undone item; handled after queue is built
                             st.session_state["undo_jump_request_id"] = str(previous_id)
+                    # Show the undone item even if filters would hide it
+                    st.session_state["status_filter"] = "all"
                     previous_prefill = undo_context.get("previous_prefill")
                     if previous_prefill:
                         st.session_state["prefill"] = previous_prefill
-                        request_ref = undo_context.get("request_id", "")
-                        st.session_state["queue_search"] = str(request_ref)
-                        st.session_state.pop("undo_context", None)
-                        st.rerun()
+                    st.session_state.pop("undo_context", None)
+                    st.session_state["reset"] = True
+                    st.rerun()
             with dismiss_col:
                 if st.button(
                     "Dismiss",
@@ -1080,8 +1081,8 @@ def main() -> None:
                 entry = option_map[selected_option]
                 label_prefill = entry.get("raw") or {}
                 st.session_state["prefill"] = deepcopy(label_prefill)
-                st.session_state["queue_search"] = str(entry["request_id"])
-                st.session_state["current_request_id"] = str(entry["request_id"])
+                # Request a jump to this id in the current working set
+                st.session_state["undo_jump_request_id"] = str(entry["request_id"])
                 st.session_state["status_filter"] = "all"
                 st.session_state.pop("undo_context", None)
                 st.session_state["reset"] = True
@@ -2000,12 +2001,13 @@ def main() -> None:
             skip_clicked = True
 
     if prev_clicked:
-        st.session_state["queue_pos"] = (idx - 1) % queue_size
+        prev_working_index = (idx - 1) % queue_size
+        target_rid = working_ids[prev_working_index]
+        # Ensure we really render the previous record, not just change index
+        st.session_state["queue_pos"] = prev_working_index
         try:
             # Move base position backward to the previous working item's base index
-            prev_working_index = (idx - 1) % queue_size
-            prev_rid = working_ids[prev_working_index]
-            prev_base_index = base_index_by_id.get(prev_rid, position)
+            prev_base_index = base_index_by_id.get(target_rid, position)
             update_queue_position(
                 supabase_client,
                 annotator_uid,
