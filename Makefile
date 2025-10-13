@@ -133,8 +133,16 @@ goa-features: goa-data ## Compute GOA feature-level correlations
 	  --doc $(GOA_FEATURES_DOC) \
 	  --asset-dir docs/assets/goa
 
+.PHONY: goa-resolution
+goa-resolution: goa-data ## Summarize GOA resolution timing stats and plot distributions
+	$(call _header,GOA Resolution)
+	$(UV) run python scripts/goa_resolution_analysis.py \
+	  --features $(GOA_FEATURES) \
+	  --output $(GOA_REPORT_DIR)/status_resolution_summary.csv \
+	  --figure docs/assets/goa/goa_resolution_boxplot.png
+
 .PHONY: goa-report
-goa-report: goa-eda goa-trends goa-features ## Assemble comprehensive GOA report
+goa-report: goa-eda goa-trends goa-features goa-resolution ## Assemble comprehensive GOA report
 	$(call _header,GOA Report)
 	$(UV) run python scripts/goa_report.py \
 	  --features $(GOA_FEATURES) \

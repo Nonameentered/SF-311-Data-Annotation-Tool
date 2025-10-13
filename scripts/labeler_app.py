@@ -62,7 +62,9 @@ DATA = Path(get_secret("LABELER_DATA_DIR", "data"))
 RAW = DATA / "transformed.jsonl"
 LABELS_DIR = Path(get_secret("LABELS_OUTPUT_DIR", str(DATA / "labels")))
 MAX_ANNOTATORS = int(get_secret("MAX_ANNOTATORS_PER_REQUEST", "3"))
+ANNOTATORS_LIMIT = min(MAX_ANNOTATORS, 2)
 SUPABASE_URL = get_secret("SUPABASE_URL")
+
 SUPABASE_PUBLISHABLE_KEY = get_secret("SUPABASE_PUBLISHABLE_KEY")
 SUPABASE_ANON_KEY = get_secret("SUPABASE_ANON_KEY")
 SUPABASE_SECRET_KEY = get_secret("SUPABASE_SECRET_KEY")
@@ -78,6 +80,7 @@ elif SUPABASE_PUBLISHABLE_KEY:
 else:
     SUPABASE_KEY = None
     SUPABASE_KEY_KIND = None
+
 BACKUP_SETTING = get_secret("LABELS_JSONL_BACKUP")
 REQUIRED_UNIQUE_FOR_COMPLETION = max(1, min(MAX_ANNOTATORS, 2))
 st.markdown(
@@ -392,6 +395,13 @@ def format_duration_hours(value: Any) -> str:
     return f"{round(days, 1)} days"
 
 
+@st.cache_resource(show_spinner=False)
+def init_supabase_client(url: str, key: str) -> Client:
+    if create_client is None:  # pragma: no cover - client optional in dev
+        raise RuntimeError("supabase client library not installed")
+    return create_client(url, key)
+
+
 def get_supabase_client() -> Optional[Client]:
     if create_client is None:
         st.error(
@@ -409,8 +419,8 @@ def get_supabase_client() -> Optional[Client]:
         )
         return None
     try:
-        return create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception as exc:
+        return init_supabase_client(SUPABASE_URL, SUPABASE_KEY)  # type: ignore[arg-type]
+    except Exception as exc:  # pragma: no cover - Supabase failure surfaced in UI
         st.error(f"Failed to initialize Supabase client: {exc}")
         return None
 
@@ -669,7 +679,7 @@ def subset(
                 continue
         if only_mine and annotator_uid not in unique_annotators(labels):
             continue
-        if not can_annotator_label(labels, annotator_uid, MAX_ANNOTATORS):
+        if not can_annotator_label(labels, annotator_uid, ANNOTATORS_LIMIT):
             continue
         out_rows.append(r)
     return out_rows
@@ -728,10 +738,12 @@ def main() -> None:
                 if label_id_to_delete and delete_label(
                     label_id_to_delete, supabase_client
                 ):
-                    st.session_state.idx = undo_context.get("previous_idx", 0)
-                    previous_prefill = undo_context.get("previous_prefill")
-                    if previous_prefill:
-                        st.session_state["prefill"] = previous_prefill
+                    previous_id = undo_context.get("request_id")
+                    if previous_id:
+                        st.session_state["pending_request_id"] = str(previous_id)
+                previous_prefill = undo_context.get("previous_prefill")
+                if previous_prefill:
+                    st.session_state["prefill"] = previous_prefill
                     request_ref = undo_context.get("request_id", "")
                     st.session_state["queue_search"] = str(request_ref)
                     st.session_state.pop("undo_context", None)
@@ -748,6 +760,9 @@ def main() -> None:
         st.logout()
         st.session_state.pop("undo_context", None)
         st.session_state.pop("prefill", None)
+        st.session_state.pop("current_request_id", None)
+        st.session_state.pop("pending_request_id", None)
+        st.session_state.pop("queue_signature", None)
         st.rerun()
 
     rows_all = load_rows(RAW)
@@ -844,6 +859,23 @@ def main() -> None:
         else:
             st.caption("No saved labels yet.")
 
+    # Quick mode presets
+    preset_cols = st.sidebar.columns(2)
+    with preset_cols[0]:
+        if st.button("Label mode"):
+            st.session_state["status_filter"] = "unlabeled"
+            st.session_state["only_mine"] = False
+            st.session_state["queue_search"] = ""
+            st.session_state["reset"] = True
+            st.rerun()
+    with preset_cols[1]:
+        if st.button("Review mode"):
+            st.session_state["status_filter"] = "needs_review"
+            st.session_state["only_mine"] = False
+            st.session_state["queue_search"] = ""
+            st.session_state["reset"] = True
+            st.rerun()
+
     has_photo = st.sidebar.selectbox("Has photo?", ["any", "with photos", "no photos"])
     has_photo = (
         None if has_photo == "any" else (True if has_photo == "with photos" else False)
@@ -905,6 +937,20 @@ def main() -> None:
         "Hotkeys: Save ↦ Ctrl/Cmd+Enter • Prev ↦ Shift/Alt+Left • Skip ↦ Shift/Alt+Right"
     )
 
+    queue_signature = json.dumps(
+        {
+            "sort": sort_mode,
+            "has_photo": has_photo,
+            "kw": sorted(kw_filters),
+            "tags": sorted(tag_filters),
+            "status": status_filter,
+            "search": search_text.strip(),
+            "only_mine": only_mine,
+            "require_context": require_rich_context,
+        },
+        sort_keys=True,
+    )
+
     rows = subset(
         rows_all,
         has_photo=has_photo,
@@ -917,33 +963,31 @@ def main() -> None:
         only_mine=only_mine,
         require_rich_context=require_rich_context,
     )
-    if sort_mode == "Recommended order":
+
+    def recommended_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
+        rid = str(record.get("request_id"))
+        status = status_by_request.get(rid, "labeled")
         status_priority = {
             "needs_review": 0,
             "unlabeled": 1,
             "labeled": 2,
         }
+        status_score = status_priority.get(status, 4)
+        photo_score = 0 if record.get("has_photo") else 1
+        context_score = -rich_context_score(record)
+        recency_score = parse_created_at(record.get("created_at")) or datetime.max
+        user_random = user_random_value(rid, annotator_uid)
+        return (status_score, photo_score, context_score, recency_score, user_random)
 
-        def recommended_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
-            rid = str(record.get("request_id"))
-            status = status_by_request.get(rid, "labeled")
-            status_score = status_priority.get(status, 4)
-            photo_score = 0 if record.get("has_photo") else 1
-            context_score = -rich_context_score(record)
-            recency_score = parse_created_at(record.get("created_at")) or datetime.max
-            user_random = user_random_value(rid, annotator_uid)
-            return (status_score, photo_score, context_score, recency_score, user_random)
+    sort_functions = {
+        "Recommended order": recommended_key,
+        "Oldest first": lambda r: parse_created_at(r.get("created_at")) or datetime.max,
+        "Newest first": lambda r: parse_created_at(r.get("created_at")) or datetime.min,
+        "Request ID": lambda r: str(r.get("request_id") or ""),
+    }
 
-        rows.sort(key=recommended_key)
-    elif sort_mode == "Oldest first":
-        rows.sort(key=lambda r: parse_created_at(r.get("created_at")) or datetime.max)
-    elif sort_mode == "Newest first":
-        rows.sort(
-            key=lambda r: parse_created_at(r.get("created_at")) or datetime.min,
-            reverse=True,
-        )
-    elif sort_mode == "Request ID":
-        rows.sort(key=lambda r: str(r.get("request_id") or ""))
+    current_sort_key = sort_functions.get(sort_mode, recommended_key)
+    rows.sort(key=current_sort_key, reverse=sort_mode == "Newest first")
 
     if not rows:
         st.warning("No items matching the filters. Adjust the sidebar.")
@@ -956,35 +1000,39 @@ def main() -> None:
         request_ids.append(rid)
         rows_by_id[rid] = row
 
-    queue_order: List[str] = st.session_state.get("queue_order", [])
-    queue_order = [rid for rid in queue_order if rid in rows_by_id]
+    reset_requested = st.session_state.pop("reset", False)
 
-    for rid in request_ids:
-        if rid not in queue_order:
-            queue_order.append(rid)
+    # Stable queue: freeze IDs and track position for deterministic navigation
+    if reset_requested or st.session_state.get("queue_signature") != queue_signature:
+        st.session_state["queue_signature"] = queue_signature
+        st.session_state["queue_ids"] = request_ids[:]
+        st.session_state["queue_pos"] = 0
 
-    if not queue_order or st.session_state.get("reset"):
-        queue_order = request_ids.copy()
+    # Prune queue_ids to currently visible rows (in case filters changed externally without signature change)
+    queue_ids: List[str] = [
+        rid for rid in st.session_state.get("queue_ids", []) if rid in rows_by_id
+    ]
+    if not queue_ids:
+        st.warning("No items matching the filters. Adjust the sidebar.")
+        st.stop()
+    st.session_state["queue_ids"] = queue_ids
 
-    st.session_state["queue_order"] = queue_order
-    st.session_state["reset"] = False
+    pos = int(st.session_state.get("queue_pos", 0))
+    if pos < 0 or pos >= len(queue_ids):
+        pos = 0
+    st.session_state["queue_pos"] = pos
 
-    current_id = st.session_state.get("current_request_id")
-    if current_id not in queue_order:
-        current_id = queue_order[0]
-        st.session_state["current_request_id"] = current_id
-
-    idx = queue_order.index(current_id)
-    st.session_state.idx = idx
+    current_id = queue_ids[pos]
+    st.session_state["current_request_id"] = current_id
+    idx = pos
+    queue_size = len(queue_ids)
 
     record = rows_by_id[current_id]
     req_id = current_id
     existing_labels = sort_labels(labels_by_request.get(req_id, []))
     latest_other_label = latest_label_excluding(existing_labels, annotator_uid)
     review_mode = latest_other_label is not None
-    current_status = request_status(
-        existing_labels, REQUIRED_UNIQUE_FOR_COMPLETION
-    )
+    current_status = request_status(existing_labels, REQUIRED_UNIQUE_FOR_COMPLETION)
 
     def widget_key(name: str) -> str:
         return f"{req_id}_{name}"
@@ -996,8 +1044,8 @@ def main() -> None:
     summary_col, action_col = st.columns([5, 2], gap="small")
     with summary_col:
         st.caption(
-            f"Queue {len(queue_order)} · Labeled {len([r for r in labels_by_request if labels_by_request[r]])} · "
-            f"Index {idx + 1}/{len(queue_order)} · Time to resolution {format_duration_hours(record.get('hours_to_resolution'))}"
+            f"Queue {queue_size} · Labeled {len([r for r in labels_by_request if labels_by_request[r]])} · "
+            f"Index {idx + 1}/{queue_size} · Time to resolution {format_duration_hours(record.get('hours_to_resolution'))}"
         )
         st.markdown(
             f"**Case snapshot:** {status_badge(record)} · {outcome_highlight(record)}"
@@ -1078,11 +1126,11 @@ def main() -> None:
 
             if num_images > 1:
                 captions: List[str] = []
-                for idx, info in enumerate(images):
+                for img_idx, info in enumerate(images):
                     details: List[str] = []
                     if info.get("status") and info.get("status") != "ok":
                         details.append(str(info.get("status")))
-                    label = f"Photo {idx + 1} of {num_images}"
+                    label = f"Photo {img_idx + 1} of {num_images}"
                     if details:
                         label = f"{label} ({'; '.join(details)})"
                     captions.append(label)
@@ -1098,7 +1146,9 @@ def main() -> None:
                         key=widget_key("image_prev"),
                         help="Show the previous photo",
                     ):
-                        st.session_state[image_index_state_key] = (stored_index - 1) % num_images
+                        st.session_state[image_index_state_key] = (
+                            stored_index - 1
+                        ) % num_images
                         st.rerun()
 
                 with nav_cols[1]:
@@ -1119,7 +1169,9 @@ def main() -> None:
                         key=widget_key("image_next"),
                         help="Show the next photo",
                     ):
-                        st.session_state[image_index_state_key] = (stored_index + 1) % num_images
+                        st.session_state[image_index_state_key] = (
+                            stored_index + 1
+                        ) % num_images
                         st.rerun()
 
                 current_index = st.session_state.get(image_index_state_key, 0)
@@ -1135,7 +1187,9 @@ def main() -> None:
                 image_caption_parts.append(str(current_info.get("status")))
             if current_info.get("local_path"):
                 image_caption_parts.append("Cached locally")
-            image_caption_parts.append(f"Viewing photo {current_index + 1} of {num_images}")
+            image_caption_parts.append(
+                f"Viewing photo {current_index + 1} of {num_images}"
+            )
             if image_source:
                 st.image(image_source, use_container_width=True)
             else:
@@ -1588,11 +1642,11 @@ def main() -> None:
                         "Observed conditions",
                         ", ".join(selected_feature_labels) or "—",
                     ),
-                        ("# of tents", str(tents_count)),
-                        ("Est. # of people", num_people_bin),
-                        ("Est. footprint (feet)", size_feet_bin),
-                    ]
-                )
+                    ("# of tents", str(tents_count)),
+                    ("Est. # of people", num_people_bin),
+                    ("Est. footprint (feet)", size_feet_bin),
+                ]
+            )
 
             if latest_any:
                 latest_any_features = coerce_features(latest_any)
@@ -1600,7 +1654,8 @@ def main() -> None:
                 latest_observed = [
                     FEATURE_DISPLAY_NAMES.get(key, key.replace("_", " ").title())
                     for key, value in (latest_any_features or {}).items()
-                    if isinstance(value, bool) and value
+                    if isinstance(value, bool)
+                    and value
                     and key in FEATURE_DISPLAY_NAMES
                 ]
                 summary_rows.extend(
@@ -1684,8 +1739,12 @@ def main() -> None:
                             ),
                             "observed": ", ".join(
                                 [
-                                    FEATURE_DISPLAY_NAMES.get(key, key.replace("_", " ").title())
-                                    for key, value in ((entry.get("features") or {})).items()
+                                    FEATURE_DISPLAY_NAMES.get(
+                                        key, key.replace("_", " ").title()
+                                    )
+                                    for key, value in (
+                                        (entry.get("features") or {})
+                                    ).items()
                                     if isinstance(value, bool)
                                     and value
                                     and key in FEATURE_DISPLAY_NAMES
@@ -1728,6 +1787,7 @@ def main() -> None:
             "Prev",
             shortcuts=["shift+left", "alt+left"],
             width="stretch",
+            key=widget_key("nav-prev-bottom"),
         ):
             prev_clicked = True
 
@@ -1737,6 +1797,7 @@ def main() -> None:
             shortcuts=["ctrl+enter", "cmd+enter"],
             button_type="primary",
             width="stretch",
+            key=widget_key("nav-save-bottom"),
         ):
             save_clicked = True
 
@@ -1745,16 +1806,27 @@ def main() -> None:
             "Skip",
             shortcuts=["shift+right", "alt+right"],
             width="stretch",
+            key=widget_key("nav-skip-bottom"),
         ):
             skip_clicked = True
 
     if prev_clicked:
-        target_idx = max(idx - 1, 0)
-        st.session_state.idx = target_idx
-        st.session_state["current_request_id"] = queue_order[target_idx]
+        st.session_state["queue_pos"] = (idx - 1) % queue_size
         reset_note_state()
         st.rerun()
     elif save_clicked:
+        # Enforce annotator cap at save-time as an extra guard
+        existing_annotators = unique_annotators(existing_labels)
+        if (annotator_uid not in existing_annotators) and (
+            len(existing_annotators) >= ANNOTATORS_LIMIT
+        ):
+            st.error(
+                "This request already has two labels; moving to the next item.",
+                icon="⚠️",
+            )
+            st.session_state["queue_pos"] = (idx + 1) % queue_size
+            reset_note_state()
+            st.rerun()
         if review_mode:
             if review_status not in ["agree", "disagree"]:
                 st.error(
@@ -1775,7 +1847,6 @@ def main() -> None:
             "annotator_uid": annotator_uid,
             "annotator": annotator_display,
             "annotator_display": annotator_display,
-            "annotator_email": raw_email or None,
             "role": annotator_role,
             "timestamp": datetime.utcnow().isoformat(),
             "priority": priority_value,
@@ -1817,10 +1888,7 @@ def main() -> None:
                 "previous_prefill": deepcopy(prefill) if prefill else None,
                 "timestamp": datetime.utcnow().isoformat(),
             }
-            current_pos = queue_order.index(req_id)
-            next_idx = current_pos + 1 if current_pos + 1 < len(queue_order) else current_pos
-            st.session_state.idx = next_idx
-            st.session_state["current_request_id"] = queue_order[next_idx]
+            st.session_state["queue_pos"] = (idx + 1) % queue_size
             reset_note_state()
             st.rerun()
         else:
@@ -1829,10 +1897,7 @@ def main() -> None:
                 icon="⚠️",
             )
     elif skip_clicked:
-        current_pos = queue_order.index(req_id)
-        next_idx = current_pos + 1 if current_pos + 1 < len(queue_order) else current_pos
-        st.session_state.idx = next_idx
-        st.session_state["current_request_id"] = queue_order[next_idx]
+        st.session_state["queue_pos"] = (idx + 1) % queue_size
         reset_note_state()
         st.rerun()
 

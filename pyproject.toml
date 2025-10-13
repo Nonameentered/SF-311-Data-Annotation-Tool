@@ -10,6 +10,7 @@ dependencies = [
  "pandas>=2.3.2",
  "pyarrow>=21.0.0",
  "rich>=14.1.0",
+ "statsmodels>=0.14.5",
  "streamlit>=1.49.1",
  "streamlit-shortcuts>=1.2.0",
  "supabase>=2.4.0",
