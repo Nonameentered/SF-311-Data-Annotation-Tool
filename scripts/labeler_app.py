@@ -1069,13 +1069,13 @@ def main() -> None:
             st.caption("No saved labels yet.")
 
     has_photo = st.sidebar.selectbox(
-        "Photo status", ["any", "with photos", "no photos"]
+        "Photo status", ["any", "with photos", "no photos"], key="photo_status"
     )
     has_photo = (
         None if has_photo == "any" else (True if has_photo == "with photos" else False)
     )
     case_status = st.sidebar.selectbox(
-        "Case status", ["any", "open only", "closed only"], index=0
+        "Case status", ["any", "open only", "closed only"], index=0, key="case_status"
     )
     case_status_value: Optional[str] = None
     if case_status == "open only":
@@ -1086,6 +1086,7 @@ def main() -> None:
         "Likely GOA (auto-suggested)",
         value=False,
         help="Include only cases whose notes/status suggest unable to locate / gone on arrival.",
+        key="goa_only",
     )
     status_default = st.session_state.get("status_filter", STATUS_FILTER_OPTIONS[0])
     if status_default not in STATUS_FILTER_OPTIONS:
@@ -1097,8 +1098,24 @@ def main() -> None:
     )
     st.session_state["status_filter"] = status_filter
     # Remove advanced filters to keep UX simple
-    if st.sidebar.button("Reset queue"):
-        st.session_state["reset"] = True
+    go_home_cols = st.sidebar.columns([1, 1])
+    with go_home_cols[0]:
+        if st.button("Reset filters"):
+            st.session_state["status_filter"] = STATUS_FILTER_OPTIONS[0]
+            st.session_state["photo_status"] = "any"
+            st.session_state["case_status"] = "any"
+            st.session_state["goa_only"] = False
+            st.session_state["reset"] = True
+            st.session_state["reset_to_first"] = True
+    with go_home_cols[1]:
+        if st.button("Go to start"):
+            # Force base position to 0 and reset
+            try:
+                update_queue_position(supabase_client, annotator_uid, dataset_hash, 0)  # type: ignore[arg-type]
+            except Exception:
+                pass
+            st.session_state["reset"] = True
+            st.session_state["reset_to_first"] = True
 
     st.sidebar.caption(
         "Hotkeys: Save ↦ Ctrl/Cmd+Enter • Prev ↦ Shift/Alt+Left • Skip ↦ Shift/Alt+Right"
@@ -1123,6 +1140,7 @@ def main() -> None:
         saved = {"queue": base_order, "position": 0}
     base_queue_ids: List[str] = list(saved.get("queue") or [])
     position = int(saved.get("position") or 0)
+    base_index_by_id: Dict[str, int] = {rid: i for i, rid in enumerate(base_queue_ids)}
 
     # Construct filtered working set without changing base order
     rows_by_id_all: Dict[str, Dict[str, Any]] = {
@@ -1151,6 +1169,20 @@ def main() -> None:
         st.stop()
 
     rows = [rows_by_id_all[rid] for rid in working_ids]
+    # Map saved base position to the first working item at or after it
+    preferred_pos = 0
+    try:
+        candidates = [
+            i
+            for i, rid in enumerate(working_ids)
+            if base_index_by_id.get(rid, -1) >= position
+        ]
+        if candidates:
+            preferred_pos = candidates[0]
+        else:
+            preferred_pos = 0
+    except Exception:
+        preferred_pos = 0
 
     def recommended_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
         rid = str(record.get("request_id"))
@@ -1183,7 +1215,10 @@ def main() -> None:
     if reset_requested or st.session_state.get("queue_signature") != queue_signature:
         st.session_state["queue_signature"] = queue_signature
         st.session_state["queue_ids"] = request_ids[:]
-        st.session_state["queue_pos"] = 0
+        if st.session_state.pop("reset_to_first", False):
+            st.session_state["queue_pos"] = 0
+        else:
+            st.session_state["queue_pos"] = preferred_pos
 
     # Prune queue_ids to currently visible rows (in case filters changed externally without signature change)
     queue_ids: List[str] = [
@@ -1580,7 +1615,7 @@ def main() -> None:
         metrics_cols = st.columns([1, 1, 1])
         with metrics_cols[0]:
             tents_count = st.number_input(
-                FEATURE_DISPLAY_NAMES["tents_count"],
+                "Tents (count)",
                 min_value=0,
                 max_value=50,
                 step=1,
@@ -1945,6 +1980,19 @@ def main() -> None:
 
     if prev_clicked:
         st.session_state["queue_pos"] = (idx - 1) % queue_size
+        try:
+            # Move base position backward to the previous working item's base index
+            prev_working_index = (idx - 1) % queue_size
+            prev_rid = working_ids[prev_working_index]
+            prev_base_index = base_index_by_id.get(prev_rid, position)
+            update_queue_position(
+                supabase_client,
+                annotator_uid,
+                dataset_hash,
+                max(prev_base_index, 0),
+            )  # type: ignore[arg-type]
+        except Exception:
+            pass
         reset_note_state()
         st.rerun()
     elif save_clicked:
@@ -2011,9 +2059,16 @@ def main() -> None:
                 "timestamp": datetime.utcnow().isoformat(),
             }
             st.session_state["queue_pos"] = (idx + 1) % queue_size
-            # Persist position to Supabase
+            # Persist base position: advance to next base index of the selected working item
             try:
-                update_queue_position(supabase_client, annotator_uid, dataset_hash, st.session_state["queue_pos"])  # type: ignore[arg-type]
+                current_rid = working_ids[idx]
+                current_base_index = base_index_by_id.get(current_rid, position)
+                update_queue_position(
+                    supabase_client,
+                    annotator_uid,
+                    dataset_hash,
+                    max(current_base_index + 1, position),
+                )  # type: ignore[arg-type]
             except Exception:
                 pass
             reset_note_state()
@@ -2026,7 +2081,14 @@ def main() -> None:
     elif skip_clicked:
         st.session_state["queue_pos"] = (idx + 1) % queue_size
         try:
-            update_queue_position(supabase_client, annotator_uid, dataset_hash, st.session_state["queue_pos"])  # type: ignore[arg-type]
+            current_rid = working_ids[idx]
+            current_base_index = base_index_by_id.get(current_rid, position)
+            update_queue_position(
+                supabase_client,
+                annotator_uid,
+                dataset_hash,
+                max(current_base_index + 1, position),
+            )  # type: ignore[arg-type]
         except Exception:
             pass
         reset_note_state()
