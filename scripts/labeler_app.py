@@ -934,34 +934,41 @@ def main() -> None:
     if undo_context:
         undo_container = st.container()
         with undo_container:
-            st.success(f"Saved request {undo_context['request_id']}.", icon="✅")
-            if st.button(
-                "Undo last save",
-                key="undo_last_save",
-                help="Removes the most recent label you saved and returns you to that request.",
-            ):
-                label_id_to_delete = undo_context.get("label_id")
-                if label_id_to_delete and delete_label(
-                    label_id_to_delete, supabase_client
+            msg_col, undo_col, dismiss_col = st.columns([6, 1.8, 1.2])
+            with msg_col:
+                st.success(
+                    f"Saved request {undo_context['request_id']}.",
+                    icon="✅",
+                )
+            with undo_col:
+                if st.button(
+                    "Undo last save",
+                    key="undo_last_save",
+                    help="Removes the most recent label you saved and returns you to that request.",
                 ):
-                    previous_id = undo_context.get("request_id")
-                    if previous_id:
-                        # Mark a navigation intent back to the undone item; handled after queue is built
-                        st.session_state["undo_jump_request_id"] = str(previous_id)
-                previous_prefill = undo_context.get("previous_prefill")
-                if previous_prefill:
-                    st.session_state["prefill"] = previous_prefill
-                    request_ref = undo_context.get("request_id", "")
-                    st.session_state["queue_search"] = str(request_ref)
+                    label_id_to_delete = undo_context.get("label_id")
+                    if label_id_to_delete and delete_label(
+                        label_id_to_delete, supabase_client
+                    ):
+                        previous_id = undo_context.get("request_id")
+                        if previous_id:
+                            # Mark a navigation intent back to the undone item; handled after queue is built
+                            st.session_state["undo_jump_request_id"] = str(previous_id)
+                    previous_prefill = undo_context.get("previous_prefill")
+                    if previous_prefill:
+                        st.session_state["prefill"] = previous_prefill
+                        request_ref = undo_context.get("request_id", "")
+                        st.session_state["queue_search"] = str(request_ref)
+                        st.session_state.pop("undo_context", None)
+                        st.rerun()
+            with dismiss_col:
+                if st.button(
+                    "Dismiss",
+                    key="dismiss_save_notice",
+                    help="Hide this message without undoing the label.",
+                ):
                     st.session_state.pop("undo_context", None)
                     st.rerun()
-            if st.button(
-                "Dismiss",
-                key="dismiss_save_notice",
-                help="Hide this message without undoing the label.",
-            ):
-                st.session_state.pop("undo_context", None)
-                st.rerun()
 
     if st.sidebar.button("Log out"):
         st.logout()
