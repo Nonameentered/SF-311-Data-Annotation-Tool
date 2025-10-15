@@ -1541,7 +1541,7 @@ def main() -> None:
 
         st.markdown("### 1. Priority & review")
         priority_label = st.radio(
-            "Priority",
+            "What priority would you give this?",
             PRIORITY_OPTIONS,
             horizontal=True,
             index=priority_index,
@@ -1549,7 +1549,7 @@ def main() -> None:
             key=widget_key("priority"),
         )
         priority_explanation = st.text_input(
-            "Priority rationale",
+            "Why this priority?",
             value=str(
                 (prefill or {}).get("features", {}).get("priority_explanation") or ""
             ),
@@ -1563,7 +1563,7 @@ def main() -> None:
             goa_values.index(goa_default) if goa_default in goa_values else 0
         )
         goa_selected_label = st.selectbox(
-            "GOA expectation",
+            'How soon would you need to response to avoid "gone on arrival" (GOA)?',
             goa_labels,
             index=goa_default_index,
             help=LABEL_TIPS["goa_window"],
@@ -1571,7 +1571,7 @@ def main() -> None:
         )
         goa_window_value = goa_values[goa_labels.index(goa_selected_label)]
         goa_explanation = st.text_input(
-            "GOA rationale",
+            "Why this response time?",
             value=str((prefill or {}).get("features", {}).get("goa_explanation") or ""),
             help="Why this GOA window? Mention cues like movement, time of day, etc.",
             key=widget_key("goa_reason"),
@@ -1586,7 +1586,7 @@ def main() -> None:
         if routing_default not in ROUTING_DEPARTMENTS:
             routing_default = "Unknown"
         routing_department = st.selectbox(
-            "Routing department",
+            "Which team should respond first?",
             ROUTING_DEPARTMENTS,
             index=ROUTING_DEPARTMENTS.index(routing_default),
             help=LABEL_TIPS["routing_department"],
@@ -1601,7 +1601,7 @@ def main() -> None:
                 key=widget_key("routing_other"),
             )
         routing_explanation = st.text_input(
-            "Routing rationale",
+            "Why this team?",
             value=str(
                 (prefill or {}).get("features", {}).get("routing_explanation") or ""
             ),
@@ -1624,7 +1624,7 @@ def main() -> None:
             label for key, label in feature_options if prefill_bool(key)
         ]
         selected_feature_labels = st.multiselect(
-            "Observed conditions",
+            "Choose anything you see in the image or ticket (from the dropdown options)",
             [label for _, label in feature_options],
             default=default_feature_labels,
             help="Select all observed conditions that apply.",
@@ -1684,7 +1684,7 @@ def main() -> None:
             st.session_state[NOTE_REQ_KEY] = req_id
             st.session_state[NOTE_STATE_KEY] = str(notes_val)
         notes = st.text_area(
-            "Notes",
+            "Anything else to add that might help us prioritize this ticket?",
             key=NOTE_STATE_KEY,
             height=110,
             help=LABEL_TIPS["notes"],
@@ -1704,7 +1704,7 @@ def main() -> None:
         prefill_sources = prefill.get("evidence_sources") if prefill else []
         valid_sources = [s for s in prefill_sources or [] if s in info_source_options]
         info_sources = st.multiselect(
-            "Information used",
+            "What information did you use in prioritizing?",
             info_source_options,
             default=(
                 valid_sources or ["Photos"]
@@ -1730,7 +1730,7 @@ def main() -> None:
                 chosen_outcome_default = str(raw_outcome)
         default_outcome_index = outcome_values.index(chosen_outcome_default)
         outcome_label = st.selectbox(
-            "Outcome alignment",
+            "What's the ideal outcome for this ticket?",
             outcome_labels,
             index=default_outcome_index,
             help=(
@@ -1764,7 +1764,7 @@ def main() -> None:
             follow_up_labels[follow_up_values.index(item)] for item in prefill_follow
         ]
         follow_up_selected_labels = st.multiselect(
-            "Follow-up needs",
+            "What other follow-up needs might this ticket generate?",
             follow_up_labels,
             default=default_follow_labels,
             help=LABEL_TIPS["follow_up_need"],
