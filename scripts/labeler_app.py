@@ -12,10 +12,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
+import pydeck as pdk
 import streamlit as st
 from streamlit.errors import StreamlitAPIException
 
 APP_TITLE = "SF311 Priority Labeler — Human-in-the-Loop"
+MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
 
 # Page config: wide mode by default
 try:
@@ -1453,6 +1455,42 @@ def main() -> None:
             else:
                 st.warning("This photo could not be loaded.")
             st.caption(" · ".join(image_caption_parts))
+
+        lat = record.get("lat")
+        lon = record.get("lon")
+        if lat is not None and lon is not None:
+            try:
+                lat_f = float(lat)
+                lon_f = float(lon)
+            except (TypeError, ValueError):
+                lat_f = None
+                lon_f = None
+            if lat_f is not None and lon_f is not None:
+                st.markdown("#### Location")
+                st.caption(
+                    "Map preview to sanity-check location for routing and prioritization."
+                )
+                map_df = pd.DataFrame([{"lat": lat_f, "lon": lon_f}])
+                view_state = pdk.ViewState(
+                    latitude=lat_f,
+                    longitude=lon_f,
+                    zoom=16,
+                    pitch=0,
+                )
+                layer = pdk.Layer(
+                    "ScatterplotLayer",
+                    data=map_df,
+                    get_position="[lon, lat]",
+                    get_fill_color=[255, 64, 64, 200],
+                    get_radius=35,
+                )
+                st.pydeck_chart(
+                    pdk.Deck(
+                        map_style=MAP_STYLE,
+                        initial_view_state=view_state,
+                        layers=[layer],
+                    )
+                )
 
     with right:
         # Review banner removed
