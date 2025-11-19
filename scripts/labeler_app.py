@@ -457,10 +457,20 @@ def reverse_geocode(
 
 def prettify_address(raw: str) -> str:
     """Collapse semicolon-separated house numbers to the first one for readability."""
-    parts = [p.strip() for p in raw.split(",")]
-    if len(parts) >= 2 and ";" in parts[0]:
-        first_number = parts[0].split(";")[0].strip()
-        parts[0] = first_number
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return raw
+    first = parts[0]
+    if ";" in first:
+        first = first.split(";")[0].strip()
+    def looks_like_house_number(text: str) -> bool:
+        cleaned = text.replace(" ", "").replace("#", "")
+        cleaned = cleaned.replace("-", "")
+        return bool(cleaned) and cleaned.isdigit()
+    if len(parts) >= 2 and looks_like_house_number(first):
+        parts = [f"{first} {parts[1]}", *parts[2:]]
+    else:
+        parts[0] = first
     return ", ".join(parts)
 
 
