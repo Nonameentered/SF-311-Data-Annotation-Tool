@@ -165,6 +165,8 @@ ROUTING_DEPARTMENTS: Sequence[str] = (
     "HEART",
     "Street Health",
     "HSOC",
+    "NST Officers",
+    "911",
     "DSS",
     "DPW",
     "Unknown",
