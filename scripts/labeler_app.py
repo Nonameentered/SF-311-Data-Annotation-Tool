@@ -13,11 +13,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 import pydeck as pdk
+import requests
 import streamlit as st
 from streamlit.errors import StreamlitAPIException
 
 APP_TITLE = "SF311 Priority Labeler — Human-in-the-Loop"
 MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
+DEFAULT_USER_AGENT = "sf311-labeler/1.0"
 
 # Page config: wide mode by default
 try:
@@ -91,6 +93,7 @@ else:
 
 BACKUP_SETTING = get_secret("LABELS_JSONL_BACKUP")
 REQUIRED_UNIQUE_FOR_COMPLETION = max(1, min(MAX_ANNOTATORS, 2))
+GEOCODER_USER_AGENT = get_secret("GEOCODER_USER_AGENT", DEFAULT_USER_AGENT)
 st.markdown(
     """
     <style>
@@ -425,6 +428,40 @@ def load_rows(path: Path) -> List[Dict[str, Any]]:
                 continue
             rows.append(json.loads(s))
     return rows
+
+
+@st.cache_data(show_spinner=False)
+def reverse_geocode(
+    lat: float, lon: float, user_agent: str = DEFAULT_USER_AGENT
+) -> Optional[str]:
+    """Return a human-readable address for a lat/lon using Nominatim."""
+    try:
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={
+                "format": "jsonv2",
+                "lat": lat,
+                "lon": lon,
+                "zoom": 18,
+                "addressdetails": 1,
+            },
+            headers={"User-Agent": user_agent},
+            timeout=6,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("display_name")
+    except Exception:
+        return None
+
+
+def prettify_address(raw: str) -> str:
+    """Collapse semicolon-separated house numbers to the first one for readability."""
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) >= 2 and ";" in parts[0]:
+        first_number = parts[0].split(";")[0].strip()
+        parts[0] = first_number
+    return ", ".join(parts)
 
 
 def coerce_features(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -1467,6 +1504,12 @@ def main() -> None:
                 lon_f = None
             if lat_f is not None and lon_f is not None:
                 st.markdown("#### Location")
+                nearest_addr = reverse_geocode(lat_f, lon_f, GEOCODER_USER_AGENT)
+                if nearest_addr:
+                    st.markdown(
+                        f"<div style='color:black;'>Nearest address: {prettify_address(nearest_addr)}</div>",
+                        unsafe_allow_html=True,
+                    )
                 st.caption(
                     "Map preview to sanity-check location for routing and prioritization."
                 )
