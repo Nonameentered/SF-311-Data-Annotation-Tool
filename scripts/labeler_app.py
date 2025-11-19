@@ -18,7 +18,8 @@ import streamlit as st
 from streamlit.errors import StreamlitAPIException
 
 APP_TITLE = "SF311 Priority Labeler — Human-in-the-Loop"
-MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
+MAPBOX_DEFAULT_STYLE = "mapbox://styles/mapbox/streets-v12"
+CARTO_FALLBACK_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
 DEFAULT_USER_AGENT = "sf311-labeler/1.0"
 
 # Page config: wide mode by default
@@ -463,15 +464,29 @@ def prettify_address(raw: str) -> str:
     first = parts[0]
     if ";" in first:
         first = first.split(";")[0].strip()
+
     def looks_like_house_number(text: str) -> bool:
         cleaned = text.replace(" ", "").replace("#", "")
         cleaned = cleaned.replace("-", "")
         return bool(cleaned) and cleaned.isdigit()
+
     if len(parts) >= 2 and looks_like_house_number(first):
         parts = [f"{first} {parts[1]}", *parts[2:]]
     else:
         parts[0] = first
     return ", ".join(parts)
+
+
+def resolve_mapbox_config() -> Tuple[str, str, Optional[Dict[str, str]]]:
+    """Return (provider, style, api_keys) for pydeck map rendering."""
+    style_url = get_secret("MAPBOX_STYLE_URL", MAPBOX_DEFAULT_STYLE)
+    token = (
+        get_secret("MAPBOX_PUBLIC_TOKEN")
+        or get_secret("MAPBOX_TOKEN")
+    )
+    if token:
+        return "mapbox", style_url, {"mapbox": token}
+    return "carto", CARTO_FALLBACK_STYLE, None
 
 
 def coerce_features(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -1503,6 +1518,7 @@ def main() -> None:
                 st.warning("This photo could not be loaded.")
             st.caption(" · ".join(image_caption_parts))
 
+        map_provider, map_style, api_keys = resolve_mapbox_config()
         lat = record.get("lat")
         lon = record.get("lon")
         if lat is not None and lon is not None:
@@ -1537,13 +1553,15 @@ def main() -> None:
                     get_fill_color=[255, 64, 64, 200],
                     get_radius=35,
                 )
-                st.pydeck_chart(
-                    pdk.Deck(
-                        map_style=MAP_STYLE,
-                        initial_view_state=view_state,
-                        layers=[layer],
-                    )
-                )
+                deck_kwargs: Dict[str, Any] = {
+                    "map_style": map_style,
+                    "initial_view_state": view_state,
+                    "layers": [layer],
+                    "map_provider": map_provider,
+                }
+                if api_keys:
+                    deck_kwargs["api_keys"] = api_keys
+                st.pydeck_chart(pdk.Deck(**deck_kwargs))
 
     with right:
         # Review banner removed
