@@ -435,23 +435,22 @@ def load_rows(path: Path) -> List[Dict[str, Any]]:
 def reverse_geocode(
     lat: float, lon: float, user_agent: str = DEFAULT_USER_AGENT
 ) -> Optional[str]:
-    """Return a human-readable address for a lat/lon using Nominatim."""
+    """Return a human-readable address for a lat/lon using Mapbox reverse geocoding."""
+    token = get_secret("MAPBOX_PUBLIC_TOKEN") or get_secret("MAPBOX_TOKEN")
+    if not token:
+        return None
     try:
         resp = requests.get(
-            "https://nominatim.openstreetmap.org/reverse",
-            params={
-                "format": "jsonv2",
-                "lat": lat,
-                "lon": lon,
-                "zoom": 18,
-                "addressdetails": 1,
-            },
+            f"https://api.mapbox.com/geocoding/v5/mapbox.places/{lon},{lat}.json",
+            params={"access_token": token, "limit": 1, "types": "address"},
             headers={"User-Agent": user_agent},
             timeout=6,
         )
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("display_name")
+        features = resp.json().get("features") or []
+        if not features:
+            return None
+        return features[0].get("place_name")
     except Exception:
         return None
 
